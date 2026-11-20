@@ -1384,21 +1384,100 @@ void __cdecl PrimaryViewTryHide_hook(void* pThis, void* reason) {
     PrimaryViewTryHide_orig(pThis, reason);
 }
 
+// --- TryHide caller filter ---
+// TryHide has no reason argument, so the caller identifies the request. The
+// callers are resolved by symbol name and bounded by the next symbol start,
+// so the filter follows code moves between builds instead of fixed RVAs.
+namespace AutoHide {
+struct Range { uintptr_t begin, end; PCWSTR label; };
+std::vector<uintptr_t> g_symbolStarts;  // sorted after resolution
+std::vector<Range> g_blocked;
+HMODULE g_image;
+
+// Callers that hide the keyboard without the user asking.
+struct Caller { PCWSTR prefix; PCWSTR label; };
+constexpr Caller kBlockedCallers[] = {
+    // Shell/app InputPane show/hide requests (focus leaving a text field,
+    // app-driven TryHide). User closes go through the X button hooks.
+    {L"?OnChangeRequestedInternal@ShellViewPositionAndSizeManager@TextInputUndocked@", L"OnChangeRequestedInternal"},
+};
+std::vector<std::pair<uintptr_t, PCWSTR>> g_pending;
+std::vector<void*> g_tryHideCandidates;
+
+void Observe(std::wstring_view decorated, PCWSTR undecorated, void* address) {
+    const auto at = reinterpret_cast<uintptr_t>(address);
+    g_symbolStarts.push_back(at);
+    for (const auto& caller : kBlockedCallers)
+        if (decorated.starts_with(caller.prefix)) g_pending.push_back({at, caller.label});
+    constexpr std::wstring_view tryHide =
+        L"WindowsInternal::ComposableShell::Experiences::TextInputUndocked::ShellViewPositionAndSizeManager::"
+        L"[WindowsInternal::ComposableShell::Experiences::TextInput::Common::IViewPositionAndSizeManager]::TryHide";
+    if (undecorated && std::wstring_view(undecorated).find(tryHide) != std::wstring_view::npos &&
+        std::wstring_view(undecorated).find(L"__abi_") == std::wstring_view::npos)
+        g_tryHideCandidates.push_back(address);
+}
+
+// The interface TryHide symbol also names an adjustor thunk (sub rcx, n; jmp
+// body). Internal callers call the body directly, so hook the body.
+static void* TryHideBody(HMODULE image) {
+    for (void* candidate : g_tryHideCandidates) {
+        const auto code = static_cast<const BYTE*>(candidate);
+        if (!ImageContains(image, code, 16, true)) continue;
+        const bool thunk = code[0] == 0xE9 ||
+            (code[0] == 0x48 && code[1] == 0x83 && code[2] == 0xE9 && code[4] == 0xE9) ||  // sub rcx, imm8; jmp
+            (code[0] == 0x48 && code[1] == 0x81 && code[2] == 0xE9 && code[7] == 0xE9);    // sub rcx, imm32; jmp
+        if (!thunk) return candidate;
+    }
+    return nullptr;
+}
+
+void Finish(HMODULE image) {
+    std::sort(g_symbolStarts.begin(), g_symbolStarts.end());
+    g_symbolStarts.erase(std::unique(g_symbolStarts.begin(), g_symbolStarts.end()), g_symbolStarts.end());
+    for (const auto& [begin, label] : g_pending) {
+        const auto next = std::upper_bound(g_symbolStarts.begin(), g_symbolStarts.end(), begin);
+        // Public symbols are sparse; cap the range so a missing neighbour
+        // cannot swallow unrelated code.
+        const uintptr_t end = next == g_symbolStarts.end() ? begin + 0x2000 : std::min(*next, begin + 0x2000);
+        g_blocked.push_back({begin, end, label});
+        VLOG(L"Auto-dismiss: blocking TryHide from %s (+%llX..+%llX)", label,
+             static_cast<unsigned long long>(begin - reinterpret_cast<uintptr_t>(image)),
+             static_cast<unsigned long long>(end - reinterpret_cast<uintptr_t>(image)));
+    }
+    g_pending.clear();
+    g_image = image;
+    if (g_blocked.empty()) Wh_Log(L"Auto-dismiss: no TryHide caller resolved; only reasoned hide paths are filtered");
+}
+
+const Range* Match(const void* returnAddress) {
+    const auto at = reinterpret_cast<uintptr_t>(returnAddress);
+    for (const auto& range : g_blocked)
+        if (at > range.begin && at <= range.end) return &range;
+    return nullptr;
+}
+}  // namespace AutoHide
+
+// The shell hides the keyboard with two calls in one burst: a reasoned
+// Deactivate ("Shell requested hide", blocked below) immediately followed by
+// an unreasoned TryHide through the COM interface. A TryHide shortly after a
+// blocked deactivation belongs to that same request.
+std::atomic<ULONGLONG> g_blockedDeactivateAt{0};
+constexpr ULONGLONG kPairedHideWindowMs = 250;
+
 VoidThis_t KeyboardTryHide_orig;
-HMODULE g_keyboardTryHideImage;
 void __cdecl KeyboardTryHide_hook(void* manager) {
     const auto caller = __builtin_return_address(0);
-    if (g_textReady && !g_unloading && ReadSettings().noAutoHide && CompactModeActive() &&
-        !KeyboardCloseRequested() && ImageContains(g_keyboardTryHideImage, caller, 1, true)) {
-        const auto offset = reinterpret_cast<uintptr_t>(caller) -
-                            reinterpret_cast<uintptr_t>(g_keyboardTryHideImage);
-        // These callers occur in the non-X trace. X uses TryHideAndNotify.
-        if ((offset == 0xF701C || offset == 0xF7406) &&
-            CompactCtrlRow::IsTouchKeyboardVisibleOnCurrentThread()) {
-            VLOG(L"Touch keyboard TryHide caller +%llX blocked by Disable auto-dismiss",
-                 static_cast<unsigned long long>(offset));
-            return;
-        }
+    if (g_textReady && !g_unloading) {
+        const auto range = AutoHide::Match(caller);
+        const bool paired = GetTickCount64() - g_blockedDeactivateAt.load() < kPairedHideWindowMs;
+        const bool block = (range || paired) && ReadSettings().noAutoHide && CompactModeActive() &&
+                           !KeyboardCloseRequested();
+        // Every caller is logged so unknown dismiss paths can be added by name.
+        VLOG(L"TryHide from +%llX (%s)%s", static_cast<unsigned long long>(
+                 reinterpret_cast<uintptr_t>(caller) - reinterpret_cast<uintptr_t>(AutoHide::g_image)),
+             range ? range->label : paired ? L"paired with blocked deactivation" : L"unclassified",
+             block ? L" blocked by Disable auto-dismiss" : L"");
+        if (block) return;
     }
     KeyboardTryHide_orig(manager);
 }
@@ -1419,6 +1498,7 @@ void __cdecl KeyboardDeactivate_hook(void* keyboard, void* reason) {
         !KeyboardCloseRequested() && wcscmp(text, L"Close Button Pressed") != 0 &&
         CompactCtrlRow::IsTouchKeyboardVisibleOnCurrentThread()) {
         VLOG(L"Touch keyboard deactivation '%s' blocked by Disable auto-dismiss", text);
+        g_blockedDeactivateAt = GetTickCount64();
         return;
     }
     KeyboardDeactivate_orig(keyboard, reason);
@@ -1970,6 +2050,7 @@ void Install(HMODULE module) {
         TRACE_BLOCK();
         if (!symbol.symbolDecorated || !symbol.address) continue;
         const std::wstring_view name = symbol.symbolDecorated;
+        AutoHide::Observe(name, symbol.symbol, const_cast<void*>(symbol.address));
         if (name.starts_with(L"?ProcessKeyAction@DefaultKeyActionHandlerImpl@Controls@"))
             process = symbol.address;
         else if (name.starts_with(L"?HandleKeyAction@ModifierStateManagerImpl@Controls@"))
@@ -3357,21 +3438,19 @@ bool HookTextInput(HMODULE mod) {
          &WNCalcDesiredSize_orig, WNCalcDesiredSize_hook, true},
     };
     bool ok = WindhawkUtils::HookSymbols(mod, hooks, ARRAYSIZE(hooks));
-    if (ok && offsetsVerified) {
-        WindhawkUtils::SYMBOL_HOOK hideHooks[] = {
-            {{L"public: virtual void __cdecl " TIU L"ShellViewPositionAndSizeManager::[" TIC L"IViewPositionAndSizeManager]::TryHide(void)",
-              L"public: void __cdecl " TIU L"ShellViewPositionAndSizeManager::[" TIC L"IViewPositionAndSizeManager]::TryHide(void)"},
-             &KeyboardTryHide_orig, KeyboardTryHide_hook, true},
-        };
-        g_keyboardTryHideImage = mod;
-        WindhawkUtils::HookSymbols(mod, hideHooks, ARRAYSIZE(hideHooks));
-        Wh_Log(L"Touch keyboard TryHide hook %s", KeyboardTryHide_orig ? L"installed" : L"unavailable");
-    }
     Wh_Log(L"TextInput hooks %s", ok ? L"ok" : L"FAILED");
     if (!TextFrameworkFocusChanged_orig) Wh_Log(L"Compact keys: native focus adapter hook unavailable");
     if (!SwipeStartDistance_orig || !g_swipeThresholdLayoutVerified) Wh_Log(L"Positive custom swipe-start distances unavailable on this TextInput build");
-    if (ok) FooterKeys::Install(mod);
-    if (!offsetsVerified) Wh_Log(L"TextInput build not offset-verified; auto-dismiss caller filter and custom swipe-start distance off");
+    if (ok) {
+        FooterKeys::Install(mod);  // also feeds the symbol pass used below
+        AutoHide::Finish(mod);
+        void* tryHide = AutoHide::TryHideBody(mod);
+        const bool hooked = tryHide &&
+            Wh_SetFunctionHook(tryHide, reinterpret_cast<void*>(KeyboardTryHide_hook),
+                               reinterpret_cast<void**>(&KeyboardTryHide_orig));
+        Wh_Log(L"Auto-dismiss: TryHide caller filter %s", hooked ? L"installed" : L"unavailable");
+    }
+    if (!offsetsVerified) Wh_Log(L"TextInput build not offset-verified; custom swipe-start distance off");
     if (!Wh_SetFunctionHook(reinterpret_cast<void*>(DispatchMessageW),
                             reinterpret_cast<void*>(CompactCtrlRow::DispatchMessage_hook),
                             reinterpret_cast<void**>(&CompactCtrlRow::g_dispatchMessage))) {
