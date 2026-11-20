@@ -21,9 +21,9 @@ Symbols resolved from Microsoft public PDBs.
   the nearest screen edge, can be flung around and always docks to an edge,
   fades after 500 ms idle, and reopens the keyboard on tap. It lives in
   explorer (popups inside TextInputHost never become visible).
-  While enabled, the bubble temporarily hides the Touch keyboard tray icon if
-  the icon is configured to show. The previous tray preference is restored when
-  the bubble or mod is disabled.
+  By default the bubble replaces the Touch keyboard tray icon: the icon is
+  hidden while the bubble is on (if it was configured to show), and your own
+  tray setting is restored when the option, the bubble or the mod is turned off.
 * **No auto-dismiss.** With Disable auto-dismiss on, the compact keyboard can
   still open automatically but only closes with its X button. Shell and app
   hide requests (Start, physical typing, focus changes) are ignored.
@@ -55,6 +55,9 @@ Symbols resolved from Microsoft public PDBs.
   $description: Keeps the touch keyboard open when Windows requests automatic dismissal. The keyboard can still be closed with its X button.
 - bubbleOnClose: true
   $name: Show floating bubble while keyboard is hidden
+- hideTrayIconWithBubble: true
+  $name: Hide the Touch keyboard tray icon while the bubble is on
+  $description: The bubble replaces the tray icon. Your original tray icon setting is restored when this, the bubble or the mod is turned off.
 - bubbleIdleOpacity: 35
   $name: Bubble opacity when idle (%)
 - bubbleIdleDelay: 500
@@ -173,6 +176,7 @@ struct Settings {
     bool hideVoiceTypingButton = false;
     bool noAutoHide = false;
     bool bubbleOnClose = false;
+    bool hideTrayIcon = false;
     int bubbleIdleAlpha = 255;
     int bubbleIdleDelay = 500;
     bool customSwipeStartDistance = false;
@@ -472,14 +476,28 @@ static void CloseShared() {
 
 constexpr DWORD kKeyboardVisibilityPollMs = 250;
 
+// TipbandDesiredVisibility: 0 never, 1 always, 2 when no keyboard is attached.
+// The user's mode is persisted in mod storage while suppressed, so an explorer
+// restart or crash in between still restores it.
 static std::mutex g_trayIconMutex;
 static DWORD g_savedTrayIconMode;
+static bool g_savedTrayIconModeLoaded;
+
+static void SaveTrayIconMode(DWORD mode) {
+    g_savedTrayIconMode = mode;
+    Wh_SetIntValue(L"savedTrayIconMode", static_cast<int>(mode));
+}
 
 static void SetTrayIconSuppressed(bool suppress) {
     constexpr auto keyPath = L"Software\\Microsoft\\TabletTip\\1.7";
     constexpr auto valueName = L"TipbandDesiredVisibility";
     {
         std::lock_guard lock(g_trayIconMutex);
+        if (!g_savedTrayIconModeLoaded) {
+            const int stored = Wh_GetIntValue(L"savedTrayIconMode", 0);
+            g_savedTrayIconMode = stored == 1 || stored == 2 ? static_cast<DWORD>(stored) : 0;
+            g_savedTrayIconModeLoaded = true;
+        }
         if (suppress ? g_unloading.load() : g_savedTrayIconMode == 0) return;
 
         HKEY key;
@@ -495,7 +513,7 @@ static void SetTrayIconSuppressed(bool suppress) {
         // Always or When no keyboard attached selection becomes the mode to restore.
         if (read != ERROR_SUCCESS || (suppress ? current != 1 && current != 2 : current != 0)) {
             if (read == ERROR_FILE_NOT_FOUND || (read == ERROR_SUCCESS && current != 0))
-                g_savedTrayIconMode = 0;
+                SaveTrayIconMode(0);
             RegCloseKey(key);
             return;
         }
@@ -507,7 +525,7 @@ static void SetTrayIconSuppressed(bool suppress) {
             Wh_Log(L"Touch keyboard tray setting: write failed (%ld)", write);
             return;
         }
-        g_savedTrayIconMode = suppress ? current : 0;
+        SaveTrayIconMode(suppress ? current : 0);
     }
     if (const HWND tray = FindWindow(L"Shell_TrayWnd", nullptr)) {
         DWORD pid = 0;
@@ -1152,7 +1170,9 @@ DWORD WINAPI WorkerThread(LPVOID) {
         if (tick >= nextVisibilityCheck) {
             nextVisibilityCheck = tick + kKeyboardVisibilityPollMs;
             const bool bubbleEnabled = ReadSettings().bubbleOnClose;
-            const bool suppressTray = bubbleEnabled && CompactModeActive();
+            // The bubble replaces the tray icon for as long as the bubble
+            // feature is on (it appears whenever the keyboard is hidden).
+            const bool suppressTray = bubbleEnabled && ReadSettings().hideTrayIcon;
             if (suppressTray != traySuppressed || tick >= nextTrayCheck) {
                 SetTrayIconSuppressed(suppressTray);
                 traySuppressed = suppressTray;
@@ -3691,6 +3711,7 @@ void LoadSettings() {
     settings.hideVoiceTypingButton = Wh_GetIntSetting(L"hideVoiceTypingButton");
     settings.noAutoHide = Wh_GetIntSetting(L"noAutoHide");
     settings.bubbleOnClose = Wh_GetIntSetting(L"bubbleOnClose");
+    settings.hideTrayIcon = Wh_GetIntSetting(L"hideTrayIconWithBubble");
     settings.bubbleIdleAlpha = std::clamp(Wh_GetIntSetting(L"bubbleIdleOpacity"), 5, 100) * 255 / 100;
     settings.bubbleIdleDelay = std::max(100, Wh_GetIntSetting(L"bubbleIdleDelay"));
     settings.customSwipeStartDistance = Wh_GetIntSetting(L"noSwipeStartDistance");
