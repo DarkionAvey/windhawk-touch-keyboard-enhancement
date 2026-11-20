@@ -1,7 +1,7 @@
 // ==WindhawkMod==
 // @id              touch-keyboard-enhancement
 // @name            Touch Keyboard Enhancement
-// @description     Touch keyboard with an edge-docking bubble, swipe typing everywhere, resizable compact layout
+// @description     Compact touch keyboard with extra keys, no auto-dismiss, an edge-docking bubble and easier swipe typing
 // @version         0.46
 // @author          engrymoon
 // @include         TextInputHost.exe
@@ -24,9 +24,13 @@ Symbols resolved from Microsoft public PDBs.
   While enabled, the bubble temporarily hides the Touch keyboard tray icon if
   the icon is configured to show. The previous tray preference is restored when
   the bubble or mod is disabled.
-* **Swipe everywhere.** Shape writing is forced on. In IMM32 apps (e.g.
-  Notepad++) the field is reported as a TSF field so Windows produces the word,
-   and the app handles the resulting text and Backspace normally.
+* **No auto-dismiss.** With Disable auto-dismiss on, the compact keyboard can
+  still open automatically but only closes with its X button. Shell and app
+  hide requests (Start, physical typing, focus changes) are ignored.
+* **Swipe.** Shape writing is forced on in the compact keyboard, and the
+  swipe-start distance can be shortened so short words of nearby letters
+  (we, as, the) swipe. Windows recognizes the word in the app, so classic
+  IMM32 edit controls (e.g. Notepad++) still receive no swiped words.
 * **Width.** The compact panel width can be adjusted (50-200%) independently
   of the Windows keyboard size. It takes effect on the next keyboard opening.
 * **Extra keys.** Two rows of functional keys (Ctrl, Win, Alt, Tab, Menu,
@@ -57,13 +61,13 @@ Symbols resolved from Microsoft public PDBs.
   $name: Fade the bubble after (ms)
 - noSwipeStartDistance: false
   $name: Use custom swipe-start distance
-  $description: Use the distance below. Turn off to use the Windows threshold.
+  $description: Use the distance below. Turn off to use the Windows threshold (about 1.8 key widths horizontally).
 - swipeStartDistancePercent: 50
   $name: Swipe-start distance (% of key width)
   $description: "0 bypasses the distance check. 50 is half a key width and 100 is one full key width. Very low values can turn taps into swipes."
 - forceSwipe: true
   $name: Force swipe (shape writing) in every field
-  $description: Enables swipe typing in all fields, including legacy IMM32 fields in included apps.
+  $description: Enables swipe typing in the compact keyboard for every field the keyboard serves.
 - horizontalScale: 100
   $name: Compact keyboard width (%)
   $description: "50–200. Adjusts key and frame width independently of height (use the Windows keyboard size setting for overall size). Reopen the keyboard to apply."
@@ -186,7 +190,7 @@ SRWLOCK g_settingsLock = SRWLOCK_INIT;
 std::atomic<bool> g_unloading{false};
 std::atomic<unsigned> g_inputSession{0};
 std::mutex g_settingsWriter;
-std::atomic<bool> g_textReady, g_inputAppReady, g_sizeReady, g_appReady;
+std::atomic<bool> g_textReady, g_inputAppReady, g_sizeReady;
 
 static Settings ReadSettings() {
     TRACE_SCOPE();
@@ -308,7 +312,6 @@ static void SendShortcut(const Settings::ShortcutChord& chord) {
 }
 
 bool g_isExplorer;
-bool g_isApp;  // any included process other than explorer/TextInputHost
 
 #define VLOG(...) do { if (g_verboseLogging) Wh_Log(__VA_ARGS__); } while (0)
 
@@ -1305,20 +1308,6 @@ void __cdecl PageOnCloseButtonPressed_hook(void* pThis) {
     TRACE_POINT(L"native close handler returned");
 }
 
-struct NativeImage {
-    DWORD stamp;
-    DWORD size;
-    DWORD checksum;
-};
-
-// Builds whose fixed caller RVAs (TryHide filter) and swipe-handler field
-// offset were verified by disassembly.
-static constexpr NativeImage kVerifiedOffsetImages[] = {
-    {0x6A8F26AA, 0x00A6D000, 0x00A656E9},
-    {0x6A8F2C59, 0x00A6D000, 0x00A690DE},
-};
-
-
 static bool ImageContains(HMODULE image, const void* address, size_t size, bool executable = false) {
     TRACE_SCOPE();
     MEMORY_BASIC_INFORMATION region{};
@@ -1329,24 +1318,6 @@ static bool ImageContains(HMODULE image, const void* address, size_t size, bool 
                                          PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))) return false;
     const auto offset = reinterpret_cast<uintptr_t>(address) - reinterpret_cast<uintptr_t>(region.BaseAddress);
     return offset < region.RegionSize && size <= region.RegionSize - offset;
-}
-
-template <size_t N>
-static bool MatchesImage(HMODULE image, const NativeImage (&supported)[N]) {
-    TRACE_SCOPE();
-    const auto base = reinterpret_cast<const BYTE*>(image);
-    const auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
-    if (!ImageContains(image, dos, sizeof(*dos)) || dos->e_magic != IMAGE_DOS_SIGNATURE ||
-        dos->e_lfanew < sizeof(*dos) || dos->e_lfanew > 4096) return false;
-    const auto pe = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
-    if (!ImageContains(image, pe, sizeof(*pe)) || pe->Signature != IMAGE_NT_SIGNATURE ||
-        pe->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) return false;
-    return std::any_of(std::begin(supported), std::end(supported), [&](const NativeImage& known) {
-        TRACE_BLOCK();
-        return known.stamp == pe->FileHeader.TimeDateStamp &&
-               known.size == pe->OptionalHeader.SizeOfImage &&
-               known.checksum == pe->OptionalHeader.CheckSum;
-    });
 }
 
 bool HookInputApp(HMODULE mod) {
@@ -1562,34 +1533,77 @@ void __cdecl ModelOnShapewritingEnabled_hook(void* pThis, void* adapter, bool en
 using SwipeStartDistance_t = bool(__cdecl*)(void*, const void*);
 SwipeStartDistance_t SwipeStartDistance_orig;
 std::atomic<float> g_swipeKeyWidth{};
-bool g_swipeThresholdLayoutVerified;
+
+// IsTraveledEnoughToStartShapewriting(this, Point const&) keeps the gesture
+// origin and a per-axis start threshold in the handler:
+//     |cur.x - origin.x| > threshold.x  ||  |cur.y - origin.y| > threshold.y
+// Both field offsets are decoded from the function's own loads at install
+// time, so a rebuilt layout is followed instead of trusted. The hook then
+// substitutes the threshold for one call and restores it, which keeps the
+// native pre-checks and comparison intact.
+size_t g_swipeThresholdOffset;  // 0 = unknown on this build
+const void* g_swipeFunction;  // resolved in the shared symbol pass
+
+static size_t DecodeSwipeThresholdOffset(HMODULE image, const void* function) {
+    const auto code = static_cast<const BYTE*>(function);
+    constexpr size_t kWindow = 0xA0;
+    if (!ImageContains(image, code, kWindow, true)) return 0;
+    // The handler pointer arrives in RCX and is usually copied to a
+    // callee-saved register (mov r64, rcx) in the prologue.
+    int self = 1;  // rcx
+    for (size_t i = 0; i + 3 <= 0x20; ++i) {
+        if (code[i] == 0x48 && code[i + 1] == 0x8B && (code[i + 2] & 0xC7) == 0xC1) {
+            self = (code[i + 2] >> 3) & 7;
+            break;
+        }
+    }
+    if (self == 4 || self == 5) return 0;  // rsp/rbp bases need SIB/other forms
+    // Collect scalar float loads from [self + disp]: movss xmm, [reg+disp8/32].
+    std::vector<uint32_t> loads;
+    for (size_t i = 0; i + 5 <= kWindow && loads.size() < 8; ++i) {
+        if (code[i] != 0xF3 || code[i + 1] != 0x0F || code[i + 2] != 0x10) continue;
+        const BYTE modrm = code[i + 3];
+        if ((modrm & 7) != self) continue;
+        if ((modrm & 0xC0) == 0x40) loads.push_back(code[i + 4]);
+        else if ((modrm & 0xC0) == 0x80 && i + 8 <= kWindow) {
+            uint32_t disp;
+            memcpy(&disp, code + i + 4, 4);
+            loads.push_back(disp);
+        }
+    }
+    // Expect origin.x, threshold.x, origin.y (+4), threshold.y (+4).
+    if (loads.size() < 4) return 0;
+    const uint32_t origin = loads[0], threshold = loads[1];
+    if (loads[2] != origin + 4 || loads[3] != threshold + 4 || origin == threshold ||
+        threshold % 4 || threshold > 0x1000) return 0;
+    return threshold;
+}
+
 bool __cdecl SwipeStartDistance_hook(void* handler, const void* point) {
     const auto settings = ReadSettings();
-    if (!g_textReady || g_unloading || !CompactModeActive() || !settings.customSwipeStartDistance)
-        return SwipeStartDistance_orig(handler, point);
-    if (settings.swipeStartDistancePercent == 0) return true;
     const float keyWidth = g_swipeKeyWidth.load(std::memory_order_relaxed);
-    if (!g_swipeThresholdLayoutVerified || !handler || !point || !std::isfinite(keyWidth) || keyWidth <= 0)
+    if (!g_textReady || g_unloading || !CompactModeActive() || !settings.customSwipeStartDistance ||
+        !g_swipeThresholdOffset || !handler || !std::isfinite(keyWidth) || keyWidth <= 0)
         return SwipeStartDistance_orig(handler, point);
 
-    // The verified native function reads the gesture origin at +0x68 and
-    // the current Point as two floats. Compare in that same coordinate space.
-    struct SwipePoint { float x, y; };
-    SwipePoint start{}, current{};
-    std::memcpy(&start, static_cast<const BYTE*>(handler) + 0x68, sizeof(start));
-    std::memcpy(&current, point, sizeof(current));
-    const float dx = current.x - start.x;
-    const float dy = current.y - start.y;
-    if (!std::isfinite(dx) || !std::isfinite(dy))
+    const auto threshold = reinterpret_cast<float*>(static_cast<BYTE*>(handler) + g_swipeThresholdOffset);
+    const float native[2] = {threshold[0], threshold[1]};
+    // Only substitute values that look like a live threshold pair.
+    if (!std::isfinite(native[0]) || !std::isfinite(native[1]) || native[0] < 0 || native[1] < 0 ||
+        native[0] > 10000 || native[1] > 10000)
         return SwipeStartDistance_orig(handler, point);
     const float distance = keyWidth * (settings.swipeStartDistancePercent / 100.0f);
-    thread_local float lastLoggedDistance = -1;
-    if (g_verboseLogging && lastLoggedDistance != distance) {
-        lastLoggedDistance = distance;
-        Wh_Log(L"Swipe start: %d%% of %.2f DIP = %.2f DIP",
-               settings.swipeStartDistancePercent, keyWidth, distance);
+    thread_local float lastLogged = -1;
+    if (g_verboseLogging && lastLogged != distance) {
+        lastLogged = distance;
+        Wh_Log(L"Swipe start: %d%% of %.2f DIP = %.2f DIP (native %.2f x %.2f)",
+               settings.swipeStartDistancePercent, keyWidth, distance, native[0], native[1]);
     }
-    return dx * dx + dy * dy >= distance * distance;
+    threshold[0] = threshold[1] = distance;
+    const bool result = SwipeStartDistance_orig(handler, point);
+    threshold[0] = native[0];
+    threshold[1] = native[1];
+    return result;
 }
 
 // --- size ---
@@ -2051,6 +2065,8 @@ void Install(HMODULE module) {
         if (!symbol.symbolDecorated || !symbol.address) continue;
         const std::wstring_view name = symbol.symbolDecorated;
         AutoHide::Observe(name, symbol.symbol, const_cast<void*>(symbol.address));
+        if (symbol.symbol && wcsstr(symbol.symbol, L"Controls::DefaultPointerHandler::IsTraveledEnoughToStartShapewriting"))
+            g_swipeFunction = symbol.address;
         if (name.starts_with(L"?ProcessKeyAction@DefaultKeyActionHandlerImpl@Controls@"))
             process = symbol.address;
         else if (name.starts_with(L"?HandleKeyAction@ModifierStateManagerImpl@Controls@"))
@@ -3413,8 +3429,6 @@ void Stop() {
 
 bool HookTextInput(HMODULE mod) {
     TRACE_SCOPE();
-    const bool offsetsVerified = MatchesImage(mod, kVerifiedOffsetImages);
-    g_swipeThresholdLayoutVerified = offsetsVerified;
     WindhawkUtils::SYMBOL_HOOK hooks[] = {
         {{L"private: void __cdecl " TIU L"ShellViewPositionAndSizeManager::PrimaryViewTryHide(class Platform::String ^)"},
          &PrimaryViewTryHide_orig, PrimaryViewTryHide_hook, true},
@@ -3440,7 +3454,6 @@ bool HookTextInput(HMODULE mod) {
     bool ok = WindhawkUtils::HookSymbols(mod, hooks, ARRAYSIZE(hooks));
     Wh_Log(L"TextInput hooks %s", ok ? L"ok" : L"FAILED");
     if (!TextFrameworkFocusChanged_orig) Wh_Log(L"Compact keys: native focus adapter hook unavailable");
-    if (!SwipeStartDistance_orig || !g_swipeThresholdLayoutVerified) Wh_Log(L"Positive custom swipe-start distances unavailable on this TextInput build");
     if (ok) {
         FooterKeys::Install(mod);  // also feeds the symbol pass used below
         AutoHide::Finish(mod);
@@ -3450,63 +3463,18 @@ bool HookTextInput(HMODULE mod) {
                                reinterpret_cast<void**>(&KeyboardTryHide_orig));
         Wh_Log(L"Auto-dismiss: TryHide caller filter %s", hooked ? L"installed" : L"unavailable");
     }
-    if (!offsetsVerified) Wh_Log(L"TextInput build not offset-verified; custom swipe-start distance off");
+    // Decoded here, before Windhawk applies the hooks, while the bytes are original.
+    g_swipeThresholdOffset = g_swipeFunction ? DecodeSwipeThresholdOffset(mod, g_swipeFunction) : 0;
+    if (!g_swipeThresholdOffset)
+        Wh_Log(L"Swipe start: threshold field not decoded; custom swipe-start distance unavailable");
+    else
+        VLOG(L"Swipe start: threshold at handler+0x%zX", g_swipeThresholdOffset);
     if (!Wh_SetFunctionHook(reinterpret_cast<void*>(DispatchMessageW),
                             reinterpret_cast<void*>(CompactCtrlRow::DispatchMessage_hook),
                             reinterpret_cast<void**>(&CompactCtrlRow::g_dispatchMessage))) {
         TRACE_BLOCK();
         Wh_Log(L"Keyboard visibility: could not hook the XAML message pump");
     }
-    return ok;
-}
-
-// ---------------------------------------------------------------------------
-// TextInputFramework.dll inside target apps (swipe output)
-// ---------------------------------------------------------------------------
-// In Notepad (TSF) a swipe ends in edit sessions inside the app; in Notepad++
-// (IMM32 via CUAS) no word was produced. These are the app-side capability
-// checks the framework reports for the focused field.
-using BoolThisApp_t = bool(__cdecl*)(void* pThis);
-using HrBoolOut_t = HRESULT(__cdecl*)(void* pThis, bool* out);
-
-#define APP_BOOL_HOOK(name, forced)                 \
-    BoolThisApp_t name##_orig;                      \
-    bool __cdecl name##_hook(void* pThis) {         \
-        TRACE_SCOPE();                             \
-        bool r = name##_orig(pThis);                \
-        return g_appReady && CompactModeActive() && ReadSettings().forceSwipe ? (forced) : r;       \
-    }
-
-APP_BOOL_HOOK(InputContext_IsImmContext, false)
-APP_BOOL_HOOK(CompositeContext_IsImmContext, false)
-APP_BOOL_HOOK(InputContext_IsWritingSuggestionsDisabled, false)
-APP_BOOL_HOOK(CompositeContext_IsWritingSuggestionsDisabled, false)
-
-HrBoolOut_t GetShapewritingEnabled_orig;
-HRESULT __cdecl GetShapewritingEnabled_hook(void* pThis, bool* out) {
-    TRACE_SCOPE();
-    HRESULT hr = GetShapewritingEnabled_orig(pThis, out);
-    if (g_appReady && CompactModeActive() && SUCCEEDED(hr) && out && ReadSettings().forceSwipe) *out = true;
-    return hr;
-}
-
-bool HookAppTextInputFramework(HMODULE mod) {
-    TRACE_SCOPE();
-    WindhawkUtils::SYMBOL_HOOK hooks[] = {
-        {{L"public: virtual bool __cdecl CInputContext::IsImmContext(void)"},
-         &InputContext_IsImmContext_orig, InputContext_IsImmContext_hook, true},
-        {{L"public: virtual bool __cdecl CCompositeContextAdapter::IsImmContext(void)"},
-         &CompositeContext_IsImmContext_orig, CompositeContext_IsImmContext_hook, true},
-        {{L"public: virtual bool __cdecl CInputContext::IsWritingSuggestionsDisabled(void)"},
-         &InputContext_IsWritingSuggestionsDisabled_orig, InputContext_IsWritingSuggestionsDisabled_hook, true},
-        {{L"public: virtual bool __cdecl CCompositeContextAdapter::IsWritingSuggestionsDisabled(void)"},
-         &CompositeContext_IsWritingSuggestionsDisabled_orig, CompositeContext_IsWritingSuggestionsDisabled_hook,
-         true},
-        {{L"public: virtual long __cdecl TextInputStateAdapter::GetShapewritingEnabled(bool *)"},
-         &GetShapewritingEnabled_orig, GetShapewritingEnabled_hook, true},
-    };
-    bool ok = WindhawkUtils::HookSymbols(mod, hooks, ARRAYSIZE(hooks));
-    Wh_Log(L"app TextInputFramework hooks %s", ok ? L"ok" : L"FAILED");
     return ok;
 }
 
@@ -3522,7 +3490,6 @@ struct ModuleHooks {
 
 ModuleHooks g_text{L"TextInput.dll", HookTextInput};
 ModuleHooks g_inputApp{L"InputApp.dll", HookInputApp};
-ModuleHooks g_app{L"TextInputFramework.dll", HookAppTextInputFramework};
 std::mutex g_moduleMutex;
 std::atomic<bool> g_scanRequested;
 std::atomic<bool> g_modulesSettled;
@@ -3547,8 +3514,6 @@ static void PublishHookReadiness() {
     g_textReady = g_text.configured;
     g_inputAppReady = g_inputApp.configured;
     g_sizeReady = g_text.configured && WNCalcDesiredSize_orig;
-    g_appReady = g_app.configured && InputContext_IsImmContext_orig && CompositeContext_IsImmContext_orig &&
-                 InputContext_IsWritingSuggestionsDisabled_orig && CompositeContext_IsWritingSuggestionsDisabled_orig;
     // The extra rows need only XAML and SendInput. The native key-action
     // hooks add sticky Ctrl/Alt for native keys when they resolve.
     FooterKeys::g_enabled = g_text.configured;
@@ -3556,16 +3521,12 @@ static void PublishHookReadiness() {
 
 static void RegisterLoadedModules() {
     TRACE_SCOPE();
-    if (g_isApp) {
-        TRACE_BLOCK();
-        g_pendingApply |= RegisterModule(g_app);
-    } else if (!g_isExplorer) {
+    if (!g_isExplorer) {
         TRACE_BLOCK();
         g_pendingApply |= RegisterModule(g_text);
         g_pendingApply |= RegisterModule(g_inputApp);
     }
-    g_modulesSettled = g_isApp ? g_app.image != nullptr :
-                       g_isExplorer || (g_text.image && g_inputApp.image);
+    g_modulesSettled = g_isExplorer || (g_text.image && g_inputApp.image);
 }
 
 static void ScanLateModules() {
@@ -3637,7 +3598,6 @@ BOOL Wh_ModInit() {
     const auto separator = wcsrchr(path, L'\\');
     const auto filename = separator ? separator + 1 : path;
     g_isExplorer = _wcsicmp(filename, L"explorer.exe") == 0;
-    g_isApp = !g_isExplorer && _wcsicmp(filename, L"textinputhost.exe") != 0;
     Wh_Log(L"init v%s in %s pid=%u", WH_MOD_VERSION, filename, GetCurrentProcessId());
     LoadSettings();
 
@@ -3708,7 +3668,7 @@ void Wh_ModUninit() {
     TRACE_SCOPE();
     if (g_isExplorer) SetTrayIconSuppressed(false);
     CompactCtrlRow::Stop();
-    if (!g_isExplorer && !g_isApp && g_shared) {
+    if (!g_isExplorer && g_shared) {
         InterlockedExchange64(&g_shared->panelVisibilityDeadline, 0);
         InterlockedExchange64(&g_shared->compactModeDeadline, 0);
     }
@@ -3742,7 +3702,7 @@ void Wh_ModUninit() {
     }
     if (!g_requiresHostRestart) {
         TRACE_BLOCK();
-        for (auto hooks : {&g_inputApp, &g_text, &g_app}) {
+        for (auto hooks : {&g_inputApp, &g_text}) {
             TRACE_BLOCK();
             if (hooks->image) FreeLibrary(hooks->image);
         }
