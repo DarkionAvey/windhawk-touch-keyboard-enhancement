@@ -603,7 +603,6 @@ static bool RenderBubbleBitmap(int d) {
     const auto faceColor = rgb(style);
     const auto borderColor = rgb(style >> 16);
     const auto glyphColor = rgb(style >> 32);
-    const float themedRadius = d * ((style >> 48) & 0xFF) / 510.0f;
     const float themedBorder = d * ((style >> 56) & 0x7F) / 254.0f;
     BITMAPINFO bi = {};
     bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
@@ -660,7 +659,8 @@ static bool RenderBubbleBitmap(int d) {
             TRACE_BLOCK();
             float px = xx + 0.5f, py = yy + 0.5f;
             float dist = sqrtf((px - c) * (px - c) + (py - c) * (py - c));
-            const float edge = style ? roundBox(px, py, c, c, r, r, themedRadius) : dist - r;
+            // Always a circle; the key style supplies colors and border only.
+            const float edge = dist - r;
             float cov = std::clamp(0.5f - edge, 0.0f, 1.0f);
             float ring = std::clamp(1.5f - fabsf(r - 1.0f - dist), 0.0f, 1.0f);  // subtle rim
             float g = glyph(px, py);
@@ -2300,8 +2300,7 @@ static void PublishBubbleKeyStyle(const Grid& keys) {
             return std::isfinite(value) ? std::lround(std::clamp(value / basis, 0.0, 0.5) * scale) : 0;
         };
         const UINT64 style = (UINT64{1} << 63) | pack(background) | (pack(border) << 16) |
-            (pack(foreground) << 32) | (fraction(face.CornerRadius().TopLeft, 510) << 48) |
-            (fraction(thickness, 254) << 56);
+            (pack(foreground) << 32) | (fraction(thickness, 254) << 56);
         InterlockedExchange64(&g_shared->bubbleKeyStyle, static_cast<LONG64>(style));
         return;
     }
