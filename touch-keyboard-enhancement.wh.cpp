@@ -2175,6 +2175,7 @@ bool g_refreshing;
 bool g_removing;
 bool g_refreshQueued;
 bool g_rowNeedsRemoval;
+ULONGLONG g_rowUnstableSince;  // see HoldRowThroughGlitch
 FrameworkElement g_layoutRoot{nullptr};
 event_token g_layoutUpdated{};
 Grid g_panel{nullptr};
@@ -2701,6 +2702,7 @@ void RemoveRow() {
     }
     g_strip = nullptr;
     g_primedFace = nullptr;
+    g_rowUnstableSince = 0;
     g_primedLabel = nullptr;
     g_keyboard = nullptr;
     g_panel = nullptr;
@@ -2981,6 +2983,23 @@ NativeKeyRow MeasureBottomRow(const Grid& keys, const UIElement& relativeTo) {
     return row;
 }
 
+// Layout switches (&123 / abc) rebuild the native keys, and for a frame or two
+// the tree fails the checks below. Once the row exists, a failure must persist
+// for kRowGraceMs before the row is hidden or removed; until then it is left
+// exactly as it is. A one-shot timer re-checks when the grace period ends.
+constexpr ULONGLONG kRowGraceMs = 400;
+constexpr UINT_PTR kGraceTimer = 3;
+
+static bool HoldRowThroughGlitch(HWND hwnd) {
+    if (!g_button || g_stopping) return false;
+    const auto now = GetTickCount64();
+    if (!g_rowUnstableSince) {
+        g_rowUnstableSince = now;
+        SetTimer(hwnd, kGraceTimer, static_cast<UINT>(kRowGraceMs + 50), nullptr);
+    }
+    return now - g_rowUnstableSince < kRowGraceMs;
+}
+
 void RefreshRow(HWND hwnd) {
     TRACE_SCOPE();
     const auto window = Window::Current();
@@ -3019,6 +3038,15 @@ void RefreshRow(HWND hwnd) {
     const bool compact = visible && panel && panel.Name() == L"TEMPLATE_PART_InputPanelGrid" &&
         count >= 33 && count <= 38 && Grid::GetRow(keyboard) == footerIndex - 1 &&
         Grid::GetRowSpan(keyboard) == 1 && panel.RowDefinitions().Size() == 9;
+    // The rows live inside the keyboard, so a hidden or mid-rebuild keyboard
+    // (empty or zero-size key grid) needs nothing done. Only a visible
+    // non-compact layout means the mode changed and the rows must go.
+    if (!visible && g_button) {
+        PublishCompactMode(false);
+        if (g_repeatingArrow) StopArrowRepeat(hwnd);
+        return;
+    }
+    if (!compact && HoldRowThroughGlitch(hwnd)) return;
     PublishCompactMode(compact);
     if (!compact) {
         FooterKeys::t_shortcut = {};
@@ -3053,7 +3081,7 @@ void RefreshRow(HWND hwnd) {
         !std::isfinite(keyboard.ActualHeight()) || keyboard.ActualHeight() <= 16 ||
         keyboard.Visibility() != Visibility::Visible) {
         TRACE_BLOCK();
-        RemoveRow();
+        if (!HoldRowThroughGlitch(hwnd)) RemoveRow();
         return;
     }
     // The compact keyboard occupies row 6. Its background and stroke
@@ -3061,7 +3089,7 @@ void RefreshRow(HWND hwnd) {
     const auto rows = panel.RowDefinitions();
     if (Grid::GetRow(keyboard) != footerIndex - 1 || Grid::GetRowSpan(keyboard) != 1 || rows.Size() != 9) {
         TRACE_BLOCK();
-        RemoveRow();
+        if (!HoldRowThroughGlitch(hwnd)) RemoveRow();
         return;
     }
     const auto footer = rows.GetAt(footerIndex);
@@ -3200,7 +3228,7 @@ void RefreshRow(HWND hwnd) {
     const double keyHeight = row.first.Height;
     if (keyWidth <= 0 || keyHeight <= 0) {
         TRACE_BLOCK();
-
+        if (HoldRowThroughGlitch(hwnd)) return;
         if (g_strip.IsHitTestVisible()) g_strip.IsHitTestVisible(false);
         if (g_strip.Opacity() != 0) g_strip.Opacity(0);
         return;
@@ -3228,6 +3256,9 @@ void RefreshRow(HWND hwnd) {
     const double arrowLeft = row.right - 3 * keyWidth - 2 * arrowSpacing;
     const bool fits = row.first.X >= 0 && arrowLeft >= row.first.X + keyWidth + arrowSpacing &&
                       lowerRowTop + keyHeight <= g_strip.ActualHeight() + 0.5;
+    if (!fits && HoldRowThroughGlitch(hwnd)) return;
+    g_rowUnstableSince = 0;
+    KillTimer(hwnd, kGraceTimer);
     if (g_strip.IsHitTestVisible() != fits) g_strip.IsHitTestVisible(fits);
     if (g_strip.Opacity() != (fits ? 1.0 : 0.0)) g_strip.Opacity(fits ? 1.0 : 0.0);
     if (!fits) return;
@@ -3298,8 +3329,9 @@ LRESULT CALLBACK UiWindowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
         if (g_repeatingArrow) FooterKeys::PressFooterKey(g_repeatingArrow);
         return 0;
     }
-    if (message == kRefresh || (message == WM_TIMER && wp == kWatchdog)) {
+    if (message == kRefresh || (message == WM_TIMER && (wp == kWatchdog || wp == kGraceTimer))) {
         TRACE_BLOCK();
+        if (message == WM_TIMER && wp == kGraceTimer) KillTimer(hwnd, kGraceTimer);
         if (message == kRefresh) g_refreshQueued = false;
         if (g_stopping || g_refreshing) return 0;
         g_refreshing = true;
