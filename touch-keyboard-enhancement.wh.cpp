@@ -2205,8 +2205,6 @@ event_token g_click{};
 struct FooterKey {
     const wchar_t* label;
     unsigned short vk;
-    int column;
-    int row;
     wchar_t glyph = 0;
     bool hasIcon = false;
     Button button{nullptr};
@@ -2219,25 +2217,26 @@ constexpr ULONGLONG kFooterHoldMs = 500;
 WORD g_heldFooterKey;
 ULONGLONG g_footerPressedAt;
 FooterKey g_footerKeys[] = {
-    {L"Win", VK_LWIN, 1, -2},
-    {L"Tab", VK_TAB, -4, -1, L'\uE7FD'},
-    {L"Alt", VK_MENU, 2, -2},
-    {L"Menu", VK_APPS, -3, -1, L'\uE700'},
-    {L"Esc", VK_ESCAPE, -2, -1},
-    {L"Del", VK_DELETE, -1, -1},
-    {L"Select all", 'A', 0, 2, L'\uE73A'},
-    {L"Copy", 'C', 1, 2, L'\uE8C8'},
-    {L"Paste", 'V', 2, 2, L'\uE77F'},
-    {L"\u2605", kSpecialShortcutKey, 3, 2, L'\uE734'},
-    {L"Print Screen", VK_SNAPSHOT, 4, 2, L'\uE722'},
-    {L"\u00AB", VK_BROWSER_BACK, 5, 2},
-    {L"\u00BB", VK_BROWSER_FORWARD, 6, 2},
-    {L"Home", VK_HOME, 0, 0},
-    {L"End", VK_END, 2, 0},
-    {L"\u2191", VK_UP, 1, 0},
-    {L"\u2190", VK_LEFT, 0, 1},
-    {L"\u2193", VK_DOWN, 1, 1},
-    {L"\u2192", VK_RIGHT, 2, 1},
+    // Positions come from kTopRow / kBottomRow in RefreshRow.
+    {L"Win", VK_LWIN},
+    {L"Tab", VK_TAB, L'\uE7FD'},
+    {L"Alt", VK_MENU},
+    {L"Menu", VK_APPS, L'\uE700'},
+    {L"Esc", VK_ESCAPE},
+    {L"Del", VK_DELETE},
+    {L"Select all", 'A', L'\uE73A'},
+    {L"Copy", 'C', L'\uE8C8'},
+    {L"Paste", 'V', L'\uE77F'},
+    {L"\u2605", kSpecialShortcutKey, L'\uE734'},
+    {L"Print Screen", VK_SNAPSHOT, L'\uE722'},
+    {L"\u00AB", VK_BROWSER_BACK},
+    {L"\u00BB", VK_BROWSER_FORWARD},
+    {L"Home", VK_HOME},
+    {L"End", VK_END},
+    {L"\u2191", VK_UP},
+    {L"\u2190", VK_LEFT},
+    {L"\u2193", VK_DOWN},
+    {L"\u2192", VK_RIGHT},
 };
 RowDefinition g_footer{nullptr};
 GridLength g_stockFooterHeight{};
@@ -3252,9 +3251,13 @@ void RefreshRow(HWND hwnd) {
         VLOG(L"Compact XAML: expanded framed footer to %.1f DIP", footerHeight);
     }
 
-    const double arrowSpacing = gap;
-    const double arrowLeft = row.right - 3 * keyWidth - 2 * arrowSpacing;
-    const bool fits = row.first.X >= 0 && arrowLeft >= row.first.X + keyWidth + arrowSpacing &&
+    // Both injected rows are one uniform 10-column grid spanning the native
+    // bottom row, so every gap matches at any width scale and the arrow
+    // columns line up. Edges snap to device pixels to keep gaps identical.
+    constexpr int kColumns = 10;
+    const double span = row.right - row.first.X;
+    const double cellWidth = (span - (kColumns - 1) * gap) / kColumns;
+    const bool fits = row.first.X >= 0 && cellWidth >= keyHeight * 0.4 &&
                       lowerRowTop + keyHeight <= g_strip.ActualHeight() + 0.5;
     if (!fits && HoldRowThroughGlitch(hwnd)) return;
     g_rowUnstableSince = 0;
@@ -3263,51 +3266,47 @@ void RefreshRow(HWND hwnd) {
     if (g_strip.Opacity() != (fits ? 1.0 : 0.0)) g_strip.Opacity(fits ? 1.0 : 0.0);
     if (!fits) return;
 
-    auto setGeometry = [](const Button& button, double left, double top, double width, double height, double font) {
+    double scale = 1;
+    try {
+        if (const auto xamlRoot = g_strip.XamlRoot()) scale = xamlRoot.RasterizationScale();
+    } catch (const hresult_error&) {}
+    if (!std::isfinite(scale) || scale <= 0) scale = 1;
+    const auto snap = [scale](double value) { return std::round(value * scale) / scale; };
+    auto place = [&](const Button& button, int column, double y, double font) {
         TRACE_BLOCK();
+        const double left = snap(row.first.X + column * (cellWidth + gap));
+        const double width = snap(row.first.X + column * (cellWidth + gap) + cellWidth) - left;
         if (Canvas::GetLeft(button) != left) Canvas::SetLeft(button, left);
-        if (Canvas::GetTop(button) != top) Canvas::SetTop(button, top);
+        if (Canvas::GetTop(button) != y) Canvas::SetTop(button, y);
         if (button.Width() != width) button.Width(width);
-        if (button.Height() != height) button.Height(height);
+        if (button.Height() != keyHeight) button.Height(keyHeight);
         if (button.FontSize() != font) button.FontSize(font);
+        if (button.Visibility() != Visibility::Visible) button.Visibility(Visibility::Visible);
     };
-    setGeometry(g_button, row.first.X, top, keyWidth, keyHeight, keyHeight * 0.36);
+    constexpr WORD kTopRow[kColumns] = {VK_CONTROL, VK_LWIN, VK_MENU, VK_TAB, VK_APPS,
+                                        VK_ESCAPE, VK_DELETE, VK_HOME, VK_UP, VK_END};
+    constexpr WORD kBottomRow[kColumns] = {'A', 'C', 'V', kSpecialShortcutKey, VK_SNAPSHOT,
+                                           VK_BROWSER_BACK, VK_BROWSER_FORWARD, VK_LEFT, VK_DOWN, VK_RIGHT};
+    const double iconFont = std::min(keyHeight * 0.36, cellWidth * 0.65);
+    const double textFont = std::min(keyHeight * 0.30, cellWidth * 0.31);
+    const double labelFont = std::min(keyHeight * 0.36, cellWidth * 0.45);  // Ctrl / Alt / Esc / Del
+    place(g_button, 0, top, labelFont);
+
     const auto foreground = GetForegroundWindow();
     if (!FooterKeys::AdapterMatchesInput(foreground)) FooterKeys::ClearAdapter();
     const auto modifier = FooterKeys::ShortcutMatchesInput(foreground) ? FooterKeys::t_shortcut.modifier : 0;
     const auto referenceFace = FunctionKeyFace(keys, row.face);
     MatchKeyFace(g_button, referenceFace, modifier == VK_CONTROL || g_modifierSlide.modifier == VK_CONTROL);
-    const double specialSpacing = gap;
-    const double leftGroupRight = row.first.X + 3 * keyWidth + 2 * specialSpacing;
-
-    const double specialWidth = std::min(keyWidth,
-        (arrowLeft - leftGroupRight - specialSpacing) / 4 - specialSpacing);
     for (const auto& key : g_footerKeys) {
         TRACE_BLOCK();
         MatchKeyFace(key.button, referenceFace, (modifier && key.vk == modifier) ||
                      (g_modifierSlide.modifier && key.vk == g_modifierSlide.modifier));
-        if (key.row == -2) {
-            setGeometry(key.button, row.first.X + key.column * (keyWidth + specialSpacing),
-                        top, keyWidth, keyHeight,
-                        key.hasIcon || key.vk == kSpecialShortcutKey ? keyHeight * 0.36 :
-                            std::min(keyHeight * 0.30, keyWidth * 0.39));
-        } else if (key.row == 2) {
-            // Fit the seven lower-row shortcuts before the three arrow keys.
-            const double width = std::min(keyWidth, std::max(0.0, (arrowLeft - row.first.X) / 7 - gap));
-            setGeometry(key.button, row.first.X + key.column * (width + gap),
-                        lowerRowTop, width, keyHeight, std::min(keyHeight * 0.36, width * 0.65));
-        } else if (key.row < 0) {
-            const auto visibility = specialWidth > 0 ? Visibility::Visible : Visibility::Collapsed;
-            if (key.button.Visibility() != visibility) key.button.Visibility(visibility);
-            if (visibility == Visibility::Collapsed) continue;
-            setGeometry(key.button, arrowLeft + key.column * (specialWidth + specialSpacing),
-                        top, specialWidth, keyHeight,
-                        std::min(keyHeight * (key.hasIcon ? 0.36 : 0.30), specialWidth * (key.hasIcon ? 0.65 : 0.39)));
-        } else {
-            setGeometry(key.button, arrowLeft + key.column * (keyWidth + arrowSpacing),
-                        key.row == 0 ? top : lowerRowTop, keyWidth, keyHeight,
-                        key.vk == VK_HOME || key.vk == VK_END ?
-                            std::min(keyHeight * 0.30, keyWidth * 0.31) : keyHeight * 0.36);
+        const bool wordLabel = key.vk == VK_HOME || key.vk == VK_END;
+        const double font = key.hasIcon || key.vk == kSpecialShortcutKey ? iconFont :
+                            wordLabel ? textFont : labelFont;
+        for (int column = 0; column < kColumns; ++column) {
+            if (kTopRow[column] == key.vk) place(key.button, column, top, font);
+            else if (kBottomRow[column] == key.vk) place(key.button, column, lowerRowTop, font);
         }
     }
 }
