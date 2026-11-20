@@ -1355,6 +1355,90 @@ void __cdecl PrimaryViewTryHide_hook(void* pThis, void* reason) {
     PrimaryViewTryHide_orig(pThis, reason);
 }
 
+// --- Native key sound ---
+// Native keys play through TextInputAudioManager::PlayAsyncInternal(clip,
+// variant). Watching those calls yields the live audio manager and the clip
+// names; the most frequent clip is the ordinary key click. Injected keys
+// replay it through the same manager, honoring the "Play key sounds" setting.
+namespace KeySound {
+// PlayAsyncInternal(String^ clip, <second>). The mangled name leaves the
+// second parameter ambiguous (String^ or IAsyncAction^), so it is never read:
+// native calls pass it through, and replays pass nullptr, valid for either.
+using Play_t = IUnknown*(__cdecl*)(void* manager, HSTRING clip, void* second);
+using Enabled_t = bool(__cdecl*)(void* manager);
+void* g_playTarget;
+Play_t g_play;
+Enabled_t g_isEnabled;
+std::mutex g_lock;
+IUnknown* g_manager;  // AddRef'd; the panel model's long-lived audio manager
+struct Clip { std::wstring name; unsigned uses; };
+std::vector<Clip> g_clips;
+thread_local bool t_replaying;
+
+void Observe(std::wstring_view decorated, void* address) {
+    if (decorated.starts_with(L"?PlayAsyncInternal@TextInputAudioManager@Controls@TextInputUndocked@"))
+        g_playTarget = address;
+    else if (decorated.starts_with(L"?IsAudioFeedbackEnabledInternal@TextInputAudioManager@Controls@TextInputUndocked@"))
+        g_isEnabled = reinterpret_cast<Enabled_t>(address);
+}
+
+IUnknown* __cdecl Play_hook(void* manager, HSTRING clip, void* second) {
+    if (!t_replaying && manager && clip && !g_unloading) {
+        UINT32 length = 0;
+        const PCWSTR text = WindowsGetStringRawBuffer(clip, &length);
+        const std::wstring_view name(text ? text : L"", text ? length : 0);
+        std::lock_guard lock(g_lock);
+        if (g_manager != manager) {
+            static_cast<IUnknown*>(manager)->AddRef();
+            if (g_manager) g_manager->Release();
+            g_manager = static_cast<IUnknown*>(manager);
+        }
+        auto it = std::find_if(g_clips.begin(), g_clips.end(), [&](const Clip& c) { return c.name == name; });
+        if (it != g_clips.end()) ++it->uses;
+        else if (!name.empty() && g_clips.size() < 32) {
+            g_clips.push_back({std::wstring(name), 1});
+            VLOG(L"Key sound: native clip '%.*s'", static_cast<int>(name.size()), name.data());
+        }
+    }
+    return g_play(manager, clip, second);
+}
+
+// Plays the ordinary key click, if one has been heard and key sounds are on.
+void PlayClick() {
+    IUnknown* manager = nullptr;
+    std::wstring clip;
+    {
+        std::lock_guard lock(g_lock);
+        if (!g_manager || g_clips.empty() || !g_play) return;
+        clip = std::max_element(g_clips.begin(), g_clips.end(),
+                                [](const Clip& a, const Clip& b) { return a.uses < b.uses; })->name;
+        manager = g_manager;
+        manager->AddRef();
+    }
+    if (!g_isEnabled || g_isEnabled(manager)) {
+        HSTRING name = nullptr;
+        if (SUCCEEDED(WindowsCreateString(clip.c_str(), static_cast<UINT32>(clip.size()), &name))) {
+            t_replaying = true;
+            if (IUnknown* action = g_play(manager, name, nullptr)) action->Release();
+            t_replaying = false;
+            WindowsDeleteString(name);
+        }
+    }
+    manager->Release();
+}
+
+bool Install() {
+    return g_playTarget && Wh_SetFunctionHook(g_playTarget, reinterpret_cast<void*>(Play_hook),
+                                              reinterpret_cast<void**>(&g_play));
+}
+
+void Release() {
+    std::lock_guard lock(g_lock);
+    if (g_manager) g_manager->Release();
+    g_manager = nullptr;
+}
+}  // namespace KeySound
+
 // --- TryHide caller filter ---
 // TryHide has no reason argument, so the caller identifies the request. The
 // callers are resolved by symbol name and bounded by the next symbol start,
@@ -2065,6 +2149,7 @@ void Install(HMODULE module) {
         if (!symbol.symbolDecorated || !symbol.address) continue;
         const std::wstring_view name = symbol.symbolDecorated;
         AutoHide::Observe(name, symbol.symbol, const_cast<void*>(symbol.address));
+        KeySound::Observe(name, const_cast<void*>(symbol.address));
         if (symbol.symbol && wcsstr(symbol.symbol, L"Controls::DefaultPointerHandler::IsTraveledEnoughToStartShapewriting"))
             g_swipeFunction = symbol.address;
         if (name.starts_with(L"?ProcessKeyAction@DefaultKeyActionHandlerImpl@Controls@"))
@@ -2202,6 +2287,8 @@ Button g_button{nullptr};
 Media::SolidColorBrush g_primedFace{nullptr};
 Media::SolidColorBrush g_primedLabel{nullptr};
 event_token g_click{};
+// Native keys click on press; every injected key shares this handler.
+Windows::Foundation::IInspectable g_soundPressed{nullptr};
 struct FooterKey {
     const wchar_t* label;
     unsigned short vk;
@@ -2661,6 +2748,7 @@ void RemoveRow() {
     if (g_button) {
         TRACE_BLOCK();
         DetachModifierSlide(g_button, g_ctrlSlideHandlers);
+        if (g_soundPressed) g_button.RemoveHandler(UIElement::PointerPressedEvent(), g_soundPressed);
         g_button.Click(g_click);
         g_button = nullptr;
     }
@@ -2670,6 +2758,7 @@ void RemoveRow() {
             if (key.vk == VK_LWIN) DetachModifierSlide(key.button, g_winSlideHandlers);
             if (key.vk == VK_MENU) DetachModifierSlide(key.button, g_altSlideHandlers);
             key.button.Click(key.click);
+            if (g_soundPressed) key.button.RemoveHandler(UIElement::PointerPressedEvent(), g_soundPressed);
             if (key.pointerPressed) {
                 key.button.RemoveHandler(UIElement::PointerPressedEvent(), key.pointerPressed);
                 key.pointerPressed = nullptr;
@@ -2701,6 +2790,7 @@ void RemoveRow() {
     }
     g_strip = nullptr;
     g_primedFace = nullptr;
+    g_soundPressed = nullptr;
     g_rowUnstableSince = 0;
     g_primedLabel = nullptr;
     g_keyboard = nullptr;
@@ -2717,6 +2807,9 @@ Button MakeButton(const hstring& label) {
     button.MinWidth(0);
     button.MinHeight(0);
     button.Padding({0, 0, 0, 0});
+    if (!g_soundPressed)
+        g_soundPressed = box_value(Input::PointerEventHandler([](auto&&, auto&&) { KeySound::PlayClick(); }));
+    button.AddHandler(UIElement::PointerPressedEvent(), g_soundPressed, true);
     return button;
 }
 
@@ -2769,8 +2862,6 @@ ControlTemplate StockKeyTemplate(Windows::UI::Color pressed, Windows::UI::Color 
                     <VisualState x:Name="PointerOver"/>
                     <VisualState x:Name="Pressed">
                         <VisualState.Setters>
-                            <Setter Target="PressScale.ScaleX" Value="0.8"/>
-                            <Setter Target="PressScale.ScaleY" Value="0.8"/>
                             <Setter Target="KeyFace.Background" Value="{StaticResource KeyPressedFace}"/>
                             <Setter Target="KeyLabel.Foreground" Value="{StaticResource KeyPressedLabel}"/>
                         </VisualState.Setters>
@@ -2779,11 +2870,10 @@ ControlTemplate StockKeyTemplate(Windows::UI::Color pressed, Windows::UI::Color 
                 </VisualStateGroup>
             </VisualStateManager.VisualStateGroups>
             <Border x:Name="KeyFace" Background="{TemplateBinding Background}"
-                    IsHitTestVisible="False" RenderTransformOrigin="0.5,0.5"
+                    IsHitTestVisible="False"
                     BorderBrush="{TemplateBinding BorderBrush}"
                     BorderThickness="{TemplateBinding BorderThickness}"
                     CornerRadius="{TemplateBinding CornerRadius}">
-                <Border.RenderTransform><ScaleTransform x:Name="PressScale"/></Border.RenderTransform>
                 <Grid>
                     <ContentPresenter x:Name="KeyLabel" Content="{TemplateBinding Content}"
                                       FontFamily="{TemplateBinding FontFamily}" FontSize="{TemplateBinding FontSize}"
@@ -3487,6 +3577,7 @@ bool HookTextInput(HMODULE mod) {
     if (ok) {
         FooterKeys::Install(mod);  // also feeds the symbol pass used below
         AutoHide::Finish(mod);
+        Wh_Log(L"Key sound: native click %s", KeySound::Install() ? L"available" : L"unavailable");
         void* tryHide = AutoHide::TryHideBody(mod);
         const bool hooked = tryHide &&
             Wh_SetFunctionHook(tryHide, reinterpret_cast<void*>(KeyboardTryHide_hook),
@@ -3698,6 +3789,7 @@ void Wh_ModUninit() {
     TRACE_SCOPE();
     if (g_isExplorer) SetTrayIconSuppressed(false);
     CompactCtrlRow::Stop();
+    KeySound::Release();
     if (!g_isExplorer && g_shared) {
         InterlockedExchange64(&g_shared->panelVisibilityDeadline, 0);
         InterlockedExchange64(&g_shared->compactModeDeadline, 0);
