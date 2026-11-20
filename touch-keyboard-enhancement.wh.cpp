@@ -27,8 +27,11 @@ Symbols resolved from Microsoft public PDBs.
 * **Swipe everywhere.** Shape writing is forced on. In IMM32 apps (e.g.
   Notepad++) the field is reported as a TSF field so Windows produces the word,
    and the app handles the resulting text and Backspace normally.
-* **Size.** On supported system binaries, the compact panel can be scaled
-  (50-200%). A new scale takes effect on the next keyboard opening.
+* **Width.** The compact panel width can be adjusted (50-200%) independently
+  of the Windows keyboard size. It takes effect on the next keyboard opening.
+* **Extra keys.** Two rows of functional keys (Ctrl, Win, Alt, Tab, Menu,
+  Esc, Del, clipboard, ★, Print Screen, Back/Forward, Home/End and arrows)
+  are added inside the compact keyboard frame.
 * **Shortcut keys.** Tap Ctrl or Alt before a shortcut key, or tap it again to
   cancel. Tap Win to open Start, or hold it for half a second and release to
   arm it for a shortcut such as Win+V. Tab also supports tap and hold.
@@ -40,9 +43,6 @@ Symbols resolved from Microsoft public PDBs.
 
 // ==WindhawkModSettings==
 /*
-- extraKeysOnRight: false
-  $name: Place extra keys on the right
-  $description: Shows the extra keys in a numpad-style block to the right of the compact keyboard. When disabled, they appear below the keyboard. Reopen the keyboard after changing this setting.
 - hideVoiceTypingButton: false
   $name: Hide voice typing button
   $description: "Hides the microphone key on the compact touch keyboard and uses its space to widen Enter."
@@ -64,12 +64,9 @@ Symbols resolved from Microsoft public PDBs.
 - forceSwipe: true
   $name: Force swipe (shape writing) in every field
   $description: Enables swipe typing in all fields, including legacy IMM32 fields in included apps.
-- scale: 100
-  $name: Compact keyboard size (%)
-  $description: 50-200. Scales the floating/compact keyboard panel.
 - horizontalScale: 100
   $name: Compact keyboard width (%)
-  $description: "50–200. Adjusts key and frame width independently of height. Multiplies the overall size setting. Reopen the keyboard to apply."
+  $description: "50–200. Adjusts key and frame width independently of height (use the Windows keyboard size setting for overall size). Reopen the keyboard to apply."
 - specialKey: "Shift+Enter"
   $name: ★ shortcut
   $description: "Use + between a key and its modifiers. Examples: Shift+Enter, Alt+Tab. Ctrl+Alt+Delete is reserved by Windows and cannot be sent by this key."
@@ -169,7 +166,6 @@ static void TraceBlock(const char* function, unsigned line) {
 #define TRACE_POINT(event) TraceLog(__func__, __LINE__, event)
 
 struct Settings {
-    bool extraKeysOnRight = false;
     bool hideVoiceTypingButton = false;
     bool noAutoHide = false;
     bool bubbleOnClose = false;
@@ -178,7 +174,6 @@ struct Settings {
     bool customSwipeStartDistance = false;
     int swipeStartDistancePercent = 50;
     bool forceSwipe = false;
-    int scale = 100;
     int horizontalScale = 100;
     struct ShortcutChord {
         std::array<WORD, 5> keys{VK_SHIFT, VK_RETURN};
@@ -582,7 +577,7 @@ static int BubbleDiameterAt(POINT pt) {
     TRACE_SCOPE();
     // TEMPLATE_PART_GripperCloseButton has Width=33 in the compact XAML dump.
     constexpr double closeButtonWidthDip = 33;
-    const double diameterDip = 1.5 * closeButtonWidthDip * ReadSettings().scale / 100.0;
+    const double diameterDip = 1.5 * closeButtonWidthDip;
     UINT dpiX = 96, dpiY = 96;
     GetDpiForMonitor(MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST), MDT_EFFECTIVE_DPI, &dpiX, &dpiY);
     return std::clamp(static_cast<int>(std::lround(diameterDip * dpiX / 96.0)), 1,
@@ -1316,8 +1311,9 @@ struct NativeImage {
     DWORD checksum;
 };
 
-// The private layouts below come from these two installed x64 TextInput images.
-static constexpr NativeImage kTextInputImages[] = {
+// Builds whose fixed caller RVAs (TryHide filter) and swipe-handler field
+// offset were verified by disassembly.
+static constexpr NativeImage kVerifiedOffsetImages[] = {
     {0x6A8F26AA, 0x00A6D000, 0x00A656E9},
     {0x6A8F2C59, 0x00A6D000, 0x00A690DE},
 };
@@ -1462,7 +1458,7 @@ bool __cdecl SipIsShapewritingEnabled_hook(void* pThis) {
     return g_textReady && CompactModeActive() && ReadSettings().forceSwipe ? true : r;
 }
 
-namespace MicAsCtrl {
+namespace FooterKeys {
 void RememberAdapter(IUnknown* adapter);
 }
 
@@ -1471,7 +1467,7 @@ TextFrameworkFocusChanged_t TextFrameworkFocusChanged_orig;
 void __cdecl TextFrameworkFocusChanged_hook(void* model, void* adapter, void* args) {
     TextFrameworkFocusChanged_orig(model, adapter, args);
     if (g_textReady && !g_unloading)
-        MicAsCtrl::RememberAdapter(static_cast<IUnknown*>(adapter));
+        FooterKeys::RememberAdapter(static_cast<IUnknown*>(adapter));
 }
 
 using OnShapewritingEnabled_t = void(__cdecl*)(void* pThis, void* adapter, bool enabled);
@@ -1480,7 +1476,7 @@ void __cdecl ModelOnShapewritingEnabled_hook(void* pThis, void* adapter, bool en
     TRACE_SCOPE();
     ModelOnShapewritingEnabled_orig(pThis, adapter, g_textReady && CompactModeActive() && ReadSettings().forceSwipe ? true : enabled);
     if (g_textReady && !g_unloading)
-        MicAsCtrl::RememberAdapter(static_cast<IUnknown*>(adapter));
+        FooterKeys::RememberAdapter(static_cast<IUnknown*>(adapter));
 }
 
 using SwipeStartDistance_t = bool(__cdecl*)(void*, const void*);
@@ -1518,17 +1514,16 @@ bool __cdecl SwipeStartDistance_hook(void* handler, const void* point) {
 
 // --- size ---
 // SizePositionInfo layout (observed, no public type info): int kind, then 18
-// floats: view w,h | panel w,h | rect x,y,w,h | rect x,y,w,h | 280 64 280 273 0 64
-// (top-area/toolbar metrics; leaving these at 100% clipped the title row),
-// then an int. All floats share one unit, so a uniform multiply keeps them
-// consistent.
+// floats: view w,h | panel w,h | rect x,y,w,h | rect x,y,w,h | toolbar
+// metrics, then an int. The hook validates the compact geometry before
+// touching anything, so a changed layout leaves the native size untouched.
 constexpr int kSizeFloats = 18;
 std::atomic<float> g_footerReserveDip{};
 namespace CompactCtrlRow {
 void NotifyModifierReleased();
 }
 
-namespace MicAsCtrl {
+namespace FooterKeys {
 extern std::atomic<bool> g_enabled;
 }
 using CalcDesiredSize_t = void*(__cdecl*)(void* pThis, void* ret);
@@ -1537,21 +1532,13 @@ void* __cdecl WNCalcDesiredSize_hook(void* pThis, void* ret) {
     TRACE_SCOPE();
     void* r = WNCalcDesiredSize_orig(pThis, ret);
     const auto settings = ReadSettings();
-    const int scale = settings.scale;
-    if (!g_sizeReady || !ret || r != ret || (scale == 100 && settings.horizontalScale == 100 && !MicAsCtrl::g_enabled)) return r;
+    if (!g_sizeReady || !ret || r != ret || (settings.horizontalScale == 100 && !FooterKeys::g_enabled)) return r;
     auto bytes = static_cast<BYTE*>(ret) + sizeof(int);
     std::array<float, kSizeFloats> values;
     std::memcpy(values.data(), bytes, sizeof(values));
     if (!std::all_of(values.begin(), values.end(), [](float value) {
-            TRACE_BLOCK();
             return std::isfinite(value) && std::abs(value) <= 100000;
         })) return r;
-    if (settings.extraKeysOnRight) {
-        VLOG(L"Compact clip probe: native view %.2fx%.2f panel %.2fx%.2f rect1 %.2f,%.2f %.2fx%.2f rect2 %.2f,%.2f %.2fx%.2f scale=%d",
-             values[0], values[1], values[2], values[3], values[4], values[5], values[6], values[7],
-             values[8], values[9], values[10], values[11], scale);
-    }
-    const float factor = scale / 100.0f;
     const float viewHeight = values[1];
     const float panelWidth = values[2];
     const float panelHeight = values[3];
@@ -1569,44 +1556,22 @@ void* __cdecl WNCalcDesiredSize_hook(void* pThis, void* ret) {
         return r;
     }
     float reserve = 0;
-    if (MicAsCtrl::g_enabled && !settings.extraKeysOnRight && panelWidth > 0 && viewHeight > 0 && panelHeight > 0) {
-        TRACE_BLOCK();
+    if (FooterKeys::g_enabled) {
+        // Room for the two injected rows below the native keys.
         reserve = 2.1f * std::clamp(panelWidth * 0.16f, 36.0f, 104.0f);
-        for (const int y : {5, 9}) {
-            const float bottom = values[y] + values[y + 2];
-            if (values[y + 2] > panelHeight / 2 &&
-                (std::abs(bottom - viewHeight) <= 2 || std::abs(bottom - panelHeight) <= 2))
-                values[y + 2] += reserve;
-        }
+        for (const int y : {5, 9})
+            if (values[y + 2] > panelHeight / 2) values[y + 2] += reserve;
         values[1] += reserve;
         values[3] += reserve;
-    }
-    // These two rectangles cover the visible keyboard below the transparent
-    // area. Probe their horizontal extent independently of the key layout.
-    if (MicAsCtrl::g_enabled && settings.extraKeysOnRight && panelWidth > 0 &&
-        std::abs(values[0] - panelWidth) <= 2 &&
-        std::abs(values[4]) <= 2 && std::abs(values[8]) <= 2 &&
-        std::abs(values[6] - panelWidth) <= 2 && std::abs(values[10] - panelWidth) <= 2 &&
-        values[5] > 0 && std::abs(values[5] + values[7] - viewHeight) <= 2 &&
-        std::abs(values[9] + values[11] - viewHeight) <= 2) {
-        values[6] += panelWidth * 0.60f;
-        values[10] += panelWidth * 0.60f;
-        VLOG(L"Compact clip probe: widened native rectangles to %.2f and %.2f DIP",
-             values[6] * factor, values[10] * factor);
-    }
-    if (scale != 100) {
-        TRACE_BLOCK();
-        for (auto& value : values) value *= factor;
     }
     if (settings.horizontalScale != 100) {
         const float widthFactor = settings.horizontalScale / 100.0f;
         // View width, panel width, and the X / width pairs of each rectangle.
         for (const int index : {0, 2, 4, 6, 8, 10}) values[index] *= widthFactor;
     }
-    const float previous = g_footerReserveDip.exchange(reserve * factor);
-    if (previous != reserve * factor)
-        VLOG(L"Compact sizing: requested view %.1f -> %.1f, panel %.1f -> %.1f (%.1f DIP footer)",
-             viewHeight * factor, values[1], panelHeight * factor, values[3], reserve * factor);
+    if (g_footerReserveDip.exchange(reserve) != reserve)
+        VLOG(L"Compact sizing: view %.1f -> %.1f DIP (%.1f DIP footer), width %d%%",
+             viewHeight, values[1], reserve, settings.horizontalScale);
     std::memcpy(bytes, values.data(), sizeof(values));
     return r;
 }
@@ -1615,10 +1580,9 @@ void* __cdecl WNCalcDesiredSize_hook(void* pThis, void* ret) {
 #define TIC L"WindowsInternal::ComposableShell::Experiences::TextInput::Common::"
 #define OSI L"WindowsUdk::ApplicationModel::OnScreenInput::"
 
-namespace MicAsCtrl {
+namespace FooterKeys {
 using ProcessAction = void(__cdecl*)(void*, void*);
 using HandleAction = bool(__cdecl*)(void*, unsigned int, void*, unsigned int);
-using ToggleDictation = void(__cdecl*)(void*);
 using GetSubtype = unsigned int(__cdecl*)(void*);
 using GetVirtualKey = unsigned int(__cdecl*)(unsigned int);
 using GetValue = HSTRING(__cdecl*)(void*);
@@ -1627,14 +1591,12 @@ using InjectKeyAbi = HRESULT(__cdecl*)(void*, void*);
 
 ProcessAction g_processAction;
 HandleAction g_handleAction;
-ToggleDictation g_toggleDictation;
 GetSubtype g_getSubtype;
 GetVirtualKey g_getVirtualKey;
 GetValue g_getValue;
 InjectRawKey g_injectRawKey;
 InjectKeyAbi g_injectKeyAbi[2];
 std::atomic<bool> g_enabled{false};
-bool g_configured;
 std::atomic<DWORD> g_arrowUiThread;
 // Accessed only on the XAML thread that owns the compact row.
 winrt::com_ptr<IUnknown> g_adapter;
@@ -1730,7 +1692,7 @@ void __cdecl ProcessAction_hook(void* handler, void* args) {
         g_processAction(handler, args);
     }
     if (action.release && !action.injected)
-        Wh_Log(L"Mic as Ctrl: key release did not reach the native injector");
+        Wh_Log(L"Footer keys: key release did not reach the native injector");
 }
 
 bool __cdecl HandleAction_hook(void* manager, unsigned int type, void* key,
@@ -1769,12 +1731,6 @@ void ToggleModifier(unsigned short modifier) {
         t_shortcut = focus ? Shortcut{target, focus, g_inputSession.load()} : Shortcut{};
         if (focus) t_shortcut.modifier = modifier;
     }
-}
-
-void __cdecl ToggleDictation_hook(void* handler) {
-    TRACE_SCOPE();
-    if (g_enabled && CompactModeActive()) ToggleModifier(VK_CONTROL);
-    else g_toggleDictation(handler);
 }
 
 bool IsNativeKeyboardAdapter(IUnknown* adapter) {
@@ -1869,12 +1825,18 @@ static winrt::com_ptr<IUnknown> GetCurrentKeyboardAdapter() {
         winrt::com_ptr<IUnknown> model;
         if (FAILED(reinterpret_cast<Getter>(g_keyboardModelGetter)(keyboardInterface.get(), model.put())) || !model)
             return {};
-        constexpr size_t adapterSlot = 9; // Native IInputPanelModel::TextFrameworkAdapter wrapper.
+        // Find the native IInputPanelModel::TextFrameworkAdapter getter in the
+        // model's vtable instead of assuming its slot.
+        constexpr size_t kMaxSlots = 48;
         const auto modelVtable = *reinterpret_cast<void* const* const*>(model.get());
-        if (!ImageContains(g_adapterImage, modelVtable, (adapterSlot + 1) * sizeof(void*))) return {};
-        const auto getter = modelVtable[adapterSlot];
-        if (std::find(g_modelAdapterGetters.begin(), g_modelAdapterGetters.end(), getter) == g_modelAdapterGetters.end())
-            return {};
+        if (!ImageContains(g_adapterImage, modelVtable, kMaxSlots * sizeof(void*))) return {};
+        void* getter = nullptr;
+        for (size_t slot = 6; slot < kMaxSlots && !getter; ++slot) {
+            if (std::find(g_modelAdapterGetters.begin(), g_modelAdapterGetters.end(), modelVtable[slot]) !=
+                g_modelAdapterGetters.end())
+                getter = modelVtable[slot];
+        }
+        if (!getter) return {};
 
         winrt::com_ptr<IUnknown> adapter;
         if (SUCCEEDED(reinterpret_cast<Getter>(getter)(model.get(), adapter.put())) &&
@@ -1962,12 +1924,39 @@ HRESULT __cdecl InjectKey_hook(void* adapter, void* args) {
     return S_OK;
 }
 
+// Decode the vtable slot that a thin virtual-call wrapper dispatches through:
+// it loads the vtable from the interface pointer in RCX, then calls, jumps or
+// loads through [rax + disp]. Accept both 8-bit and 32-bit displacements and
+// skip a short prologue so compiler changes do not break the lookup.
+static size_t FindVirtualDispatchSlot(HMODULE module, const void* function) {
+    const auto code = static_cast<const BYTE*>(function);
+    constexpr size_t kWindow = 48;
+    if (!ImageContains(module, code, kWindow, true)) return 0;
+    for (size_t i = 0; i + 3 <= kWindow; ++i) {
+        // mov rax, [rcx]
+        if (code[i] != 0x48 || code[i + 1] != 0x8B || code[i + 2] != 0x01) continue;
+        for (size_t j = i + 3; j + 6 <= kWindow && j < i + 24; ++j) {
+            uint32_t offset = 0;
+            const BYTE op = code[j], modrm = code[j + 1];
+            const bool rex = op == 0x48 && code[j + 1] == 0x8B;  // mov reg, [rax+disp]
+            const BYTE m = rex ? code[j + 2] : modrm;
+            const bool indirect = op == 0xFF && ((m & 0x38) == 0x10 || (m & 0x38) == 0x20);  // call/jmp
+            if (!rex && !indirect) continue;
+            const size_t at = j + (rex ? 3 : 2);
+            if ((m & 0xC7) == 0x80) memcpy(&offset, code + at, 4);       // [rax+disp32]
+            else if ((m & 0xC7) == 0x40) offset = code[at];               // [rax+disp8]
+            else continue;
+            if (offset >= 6 * sizeof(void*) && offset < 0x400 && offset % sizeof(void*) == 0)
+                return offset / sizeof(void*);
+        }
+    }
+    return 0;
+}
+
 void Install(HMODULE module) {
     TRACE_SCOPE();
-    if (!MatchesImage(module, kTextInputImages)) return;
     void* process = nullptr;
     void* handle = nullptr;
-    void* toggle = nullptr;
     void* inject[2]{};
     bool ambiguousInject = false;
     WH_FIND_SYMBOL symbol{};
@@ -1985,8 +1974,6 @@ void Install(HMODULE module) {
             process = symbol.address;
         else if (name.starts_with(L"?HandleKeyAction@ModifierStateManagerImpl@Controls@"))
             handle = symbol.address;
-        else if (name.starts_with(L"?ToggleDictationKey@DefaultKeyActionHandlerImpl@Controls@"))
-            toggle = symbol.address;
         // The projected ITextFrameworkAdapter::InjectKey wrapper is folded
         // with IToolBarList::Clear. Hook the adapter's concrete ABI instead.
         else if (name.starts_with(L"?__abi_WindowsInternal_ComposableShell_Experiences_TextInput_Common_ITextFrameworkAdapter____abi_InjectKey@?QITextFrameworkAdapter@") &&
@@ -2018,7 +2005,7 @@ void Install(HMODULE module) {
                  ImageContains(module, symbol.address, 1, true))
             g_adapterRawMethods.push_back(symbol.address);
     } while (Wh_FindNextSymbol(search, &symbol));
-    const void* code[] = {process, handle, toggle, inject[0], inject[1], reinterpret_cast<void*>(g_injectRawKey),
+    const void* code[] = {process, handle, inject[0], inject[1], reinterpret_cast<void*>(g_injectRawKey),
                           reinterpret_cast<void*>(g_getSubtype), reinterpret_cast<void*>(g_getVirtualKey),
                           reinterpret_cast<void*>(g_getValue)};
     if (ambiguousInject || inject[0] == inject[1] ||
@@ -2027,28 +2014,18 @@ void Install(HMODULE module) {
             return ImageContains(module, address, 1, true);
         })) {
         TRACE_BLOCK();
-        Wh_Log(L"Mic as Ctrl: required native key-action symbols unavailable");
+        Wh_Log(L"Footer keys: required native key-action symbols unavailable");
         return;
     }
-    // Locate the virtual dispatch slot in the native raw-key wrapper. If
-    // this build uses a different wrapper, leave standalone arrows idle.
-    const auto wrapper = reinterpret_cast<const BYTE*>(g_injectRawKey);
-    constexpr BYTE vtableLoad[] = {0x48, 0x8B, 0x01, 0x48, 0x8B, 0x80};
-    if (ImageContains(module, wrapper, 4 + sizeof(vtableLoad) + sizeof(uint32_t), true) &&
-        memcmp(wrapper + 4, vtableLoad, sizeof(vtableLoad)) == 0) {
-        TRACE_BLOCK();
-        uint32_t slotOffset = 0;
-        memcpy(&slotOffset, wrapper + 4 + sizeof(vtableLoad), sizeof(slotOffset));
-        if (slotOffset >= 6 * sizeof(void*) && slotOffset < 0x200 &&
-            slotOffset % sizeof(void*) == 0) {
-            TRACE_BLOCK();
-            g_adapterRawSlot = slotOffset / sizeof(void*);
-        }
+    // Locate the virtual dispatch slot in the native raw-key wrapper.
+    g_adapterRawSlot = FindVirtualDispatchSlot(module, reinterpret_cast<const void*>(g_injectRawKey));
+    if (!g_adapterRawSlot || g_adapterRawMethods.empty()) {
+        Wh_Log(L"Footer keys: native raw-key dispatch not found; sticky Ctrl/Alt for native keys unavailable");
+        return;
     }
-    if (!g_adapterRawSlot || g_adapterRawMethods.empty()) return;
     g_adapterImage = module;
-    if (g_keyboardModelGetter && ImageContains(module, g_keyboardControlVtable, 32 * sizeof(void*))) {
-        for (size_t slot = 6; slot < 32; ++slot) {
+    if (g_keyboardModelGetter && ImageContains(module, g_keyboardControlVtable, 48 * sizeof(void*))) {
+        for (size_t slot = 6; slot < 48; ++slot) {
             if (g_keyboardControlVtable[slot] == g_keyboardModelGetter) {
                 g_keyboardModelSlot = slot;
                 break;
@@ -2065,13 +2042,10 @@ void Install(HMODULE module) {
         Wh_SetFunctionHook(inject[0], reinterpret_cast<void*>(InjectKey_hook<0>),
                            reinterpret_cast<void**>(&g_injectKeyAbi[0])) &&
         Wh_SetFunctionHook(inject[1], reinterpret_cast<void*>(InjectKey_hook<1>),
-                           reinterpret_cast<void**>(&g_injectKeyAbi[1])) &&
-        Wh_SetFunctionHook(toggle, reinterpret_cast<void*>(ToggleDictation_hook),
-                           reinterpret_cast<void**>(&g_toggleDictation));
-    g_configured = installed;
-    Wh_Log(L"Mic as Ctrl: native key-action hooks %s", installed ? L"installed" : L"failed");
+                           reinterpret_cast<void**>(&g_injectKeyAbi[1]));
+    Wh_Log(L"Footer keys: native key-action hooks %s", installed ? L"installed" : L"failed");
 }
-}  // namespace MicAsCtrl
+}  // namespace FooterKeys
 
 namespace CompactCtrlRow {
 using namespace winrt;
@@ -2108,120 +2082,10 @@ FrameworkElement g_layoutRoot{nullptr};
 event_token g_layoutUpdated{};
 Grid g_panel{nullptr};
 FrameworkElement g_keyboard{nullptr};
-Grid g_sideHost{nullptr};
-Border g_sideSurface{nullptr};
-ColumnDefinition g_sideColumn{nullptr};
-ColumnDefinition g_nativeStarColumn{nullptr};
-GridLength g_nativeStarWidth{};
-Windows::Foundation::IInspectable g_nativePanelWidth{nullptr};
-double g_stockPanelWidth{};
-FrameworkElement g_sideOuterFrame{nullptr};
-Windows::Foundation::IInspectable g_sideOuterWidth{nullptr};
-double g_stockOuterWidth{};
-
-bool g_probeWindowLogged{};
-bool g_probeCompositionLogged{};
-
-void LogSideCompositionClips(const UIElement& surface) {
-    using Windows::UI::Composition::InsetClip;
-    using Windows::UI::Xaml::Hosting::ElementCompositionPreview;
-    int depth = 0;
-    for (DependencyObject node = surface; node && depth < 40;
-         node = VisualTreeHelper::GetParent(node), ++depth) {
-        const auto element = node.try_as<UIElement>();
-        if (!element) continue;
-        const auto visual = ElementCompositionPreview::GetElementVisual(element);
-        if (!visual) continue;
-        const auto clip = visual.Clip();
-        const auto size = visual.Size();
-        if (const auto inset = clip.try_as<InsetClip>()) {
-            Wh_Log(L"Compact clip probe: visual %d %.2fx%.2f inset L%.2f T%.2f R%.2f B%.2f",
-                   depth, size.x, size.y, inset.LeftInset(), inset.TopInset(), inset.RightInset(), inset.BottomInset());
-        } else {
-            const auto type = clip ? get_class_name(clip) : hstring(L"none");
-            Wh_Log(L"Compact clip probe: visual %d %.2fx%.2f clip=%s", depth, size.x, size.y, type.c_str());
-        }
-    }
-}
-
-struct SideAncestorWidth {
-    FrameworkElement element;
-    Windows::Foundation::IInspectable original;
-    double applied;
-};
-std::vector<SideAncestorWidth> g_sideAncestorWidths;
-FrameworkElement g_clippedPresenter{nullptr};
-Media::RectangleGeometry g_originalPresenterClip{nullptr};
-Media::RectangleGeometry g_expandedPresenterClip{nullptr};
-
-void ExpandSideAncestors(const FrameworkElement& frame, double width) {
-    if (g_sideAncestorWidths.empty()) {
-        const auto property = FrameworkElement::WidthProperty();
-        for (auto node = VisualTreeHelper::GetParent(frame); node; node = VisualTreeHelper::GetParent(node)) {
-            const auto element = node.try_as<FrameworkElement>();
-            if (!element) continue;
-            if (element.Name() == L"ParentControl" ||
-                (std::isfinite(element.Width()) && element.Width() > 0))
-                g_sideAncestorWidths.push_back({element, element.ReadLocalValue(property), 0});
-            if (element.try_as<ScrollContentPresenter>()) g_clippedPresenter = element;
-            if (element.try_as<ScrollViewer>()) break;
-        }
-    }
-    for (auto& entry : g_sideAncestorWidths) {
-        if (entry.element.Width() != width) entry.element.Width(width);
-        entry.applied = width;
-    }
-    if (g_clippedPresenter) {
-        const auto clip = g_clippedPresenter.Clip().try_as<Media::RectangleGeometry>();
-        if (clip && !clip.Transform()) {
-            auto bounds = clip.Rect();
-            if (bounds.Width > 0 && bounds.Width < width) {
-                if (clip != g_expandedPresenterClip) g_originalPresenterClip = clip;
-                bounds.Width = static_cast<float>(width);
-                Media::RectangleGeometry expanded;
-                expanded.Rect(bounds);
-                g_clippedPresenter.Clip(expanded);
-                g_expandedPresenterClip = expanded;
-            }
-        }
-    }
-}
-
-void RestoreSideAncestors() {
-    if (g_clippedPresenter && g_expandedPresenterClip &&
-        g_clippedPresenter.Clip() == g_expandedPresenterClip)
-        g_clippedPresenter.Clip(g_originalPresenterClip);
-    g_clippedPresenter = nullptr;
-    g_originalPresenterClip = nullptr;
-    g_expandedPresenterClip = nullptr;
-    const auto property = FrameworkElement::WidthProperty();
-    for (auto& entry : g_sideAncestorWidths) {
-        if (entry.element.Width() != entry.applied) continue;
-        if (entry.original == DependencyProperty::UnsetValue()) entry.element.ClearValue(property);
-        else entry.element.SetValue(property, entry.original);
-    }
-    g_sideAncestorWidths.clear();
-}
 
 struct CoreWindowHandle : IUnknown {
     virtual HRESULT STDMETHODCALLTYPE get_WindowHandle(HWND* hwnd) = 0;
 };
-
-HWND g_sideWindow{};
-int g_originalWindowWidth{};
-int g_appliedWindowWidth{};
-
-void RestoreSideWindow() {
-    RECT bounds{};
-    if (g_sideWindow && GetWindowRect(g_sideWindow, &bounds) &&
-        bounds.right - bounds.left == g_appliedWindowWidth) {
-        SetWindowPos(g_sideWindow, nullptr, 0, 0, g_originalWindowWidth,
-                     bounds.bottom - bounds.top, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
-    }
-    g_sideWindow = nullptr;
-    g_originalWindowWidth = 0;
-    g_appliedWindowWidth = 0;
-}
 
 static HWND GetCoreWindowHandle(const Window& window) {
     const auto core = window.CoreWindow();
@@ -2233,30 +2097,6 @@ static HWND GetCoreWindowHandle(const Window& window) {
     if (!interop || FAILED(interop->get_WindowHandle(&hwnd)) ||
         GetWindowThreadProcessId(hwnd, nullptr) != GetCurrentThreadId()) return nullptr;
     return hwnd;
-}
-
-void ResizeSideWindow(const Window& window, double requiredWidthDip) {
-    const HWND hwnd = GetCoreWindowHandle(window);
-    if (!hwnd) return;
-
-    RECT client{}, bounds{};
-    const UINT dpi = GetDpiForWindow(hwnd);
-    if (!dpi || !GetClientRect(hwnd, &client) || !GetWindowRect(hwnd, &bounds)) return;
-    const int clientWidth = client.right - client.left;
-    const int currentWidth = bounds.right - bounds.left;
-    const int requiredWidth = static_cast<int>(std::ceil(requiredWidthDip * dpi / 96.0)) +
-                              currentWidth - clientWidth;
-    if (currentWidth >= requiredWidth || (hwnd == g_sideWindow && requiredWidth == g_appliedWindowWidth))
-        return;
-    if (hwnd != g_sideWindow) RestoreSideWindow();
-    if (!g_sideWindow) g_originalWindowWidth = currentWidth;
-    g_sideWindow = hwnd;
-    g_appliedWindowWidth = requiredWidth;
-    if (!SetWindowPos(hwnd, nullptr, 0, 0, requiredWidth, bounds.bottom - bounds.top,
-                      SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE)) {
-        Wh_Log(L"Compact side keys: host window resize failed (%lu)", GetLastError());
-        g_sideWindow = nullptr;
-    }
 }
 
 Canvas g_strip{nullptr};
@@ -2411,16 +2251,6 @@ bool IsTouchKeyboardVisibleOnCurrentThread() {
     }
 }
 
-struct NativeKeyPosition {
-    FrameworkElement key;
-    double originalLeft;
-    double appliedLeft;
-    double originalWidth;
-    double appliedWidth;
-};
-std::vector<NativeKeyPosition> g_nativeKeyPositions;
-FrameworkElement g_hiddenMic{nullptr};
-
 Border g_enterFace{nullptr};
 TextBlock g_enterLabel{nullptr};
 Windows::Foundation::IInspectable g_enterOriginalForeground{nullptr};
@@ -2487,79 +2317,99 @@ void ColorNativeEnter(const Grid& keys) {
     enterLabel.Foreground(g_primedLabel);
 }
 
-void RestoreNativeBottomRow() {
-    for (const auto& position : g_nativeKeyPositions) {
-        auto margin = position.key.Margin();
-        if (margin.Left == position.appliedLeft) {
-            margin.Left = position.originalLeft;
-            position.key.Margin(margin);
-        }
-        if (position.originalWidth != position.appliedWidth && position.key.Width() == position.appliedWidth)
-            position.key.Width(position.originalWidth);
-    }
-    g_nativeKeyPositions.clear();
-    if (g_hiddenMic) {
-        if (g_hiddenMic.Visibility() == Visibility::Collapsed) g_hiddenMic.Visibility(Visibility::Visible);
-        g_hiddenMic = nullptr;
-    }
+// Hide voice typing: the native keyboard recycles key elements across
+// layouts (letters, numbers, symbols) and caches their layout properties, so
+// Margin/Width/Visibility edits leak into other views. Only render-time
+// properties the keyboard never sets are touched here, each change is undone
+// by identity, and the edit is re-validated against the live row on every
+// refresh.
+struct RenderEdit {
+    UIElement element{nullptr};
+    DependencyProperty property{nullptr};
+    Windows::Foundation::IInspectable original{nullptr};
+    Windows::Foundation::IInspectable applied{nullptr};
+};
+std::vector<RenderEdit> g_bottomRowEdits;
+FrameworkElement g_hiddenMic{nullptr};
+std::vector<FrameworkElement> g_editedRow;
+
+static void ApplyRenderEdit(const UIElement& element, const DependencyProperty& property,
+                            const Windows::Foundation::IInspectable& value) {
+    g_bottomRowEdits.push_back({element, property, element.ReadLocalValue(property), value});
+    element.SetValue(property, value);
 }
 
-void WidenNativeEnter(const Grid& keys) {
-    if (g_hiddenMic) {
-        uint32_t index;
-        const auto children = keys.Children();
-        const bool current = children.IndexOf(g_hiddenMic, index) &&
-            g_hiddenMic.Visibility() == Visibility::Collapsed &&
-            std::all_of(g_nativeKeyPositions.begin(), g_nativeKeyPositions.end(), [&](const auto& position) {
-                return children.IndexOf(position.key, index) &&
-                       position.key.Margin().Left == position.appliedLeft &&
-                       position.key.Width() == position.appliedWidth;
-            });
-        if (current) return;
-        RestoreNativeBottomRow();
+void RestoreNativeBottomRow() {
+    for (auto it = g_bottomRowEdits.rbegin(); it != g_bottomRowEdits.rend(); ++it) {
+        if (it->element.ReadLocalValue(it->property) != it->applied) continue;
+        if (it->original == DependencyProperty::UnsetValue()) it->element.ClearValue(it->property);
+        else it->element.SetValue(it->property, it->original);
     }
+    g_bottomRowEdits.clear();
+    g_editedRow.clear();
+    g_hiddenMic = nullptr;
+}
 
+static std::vector<FrameworkElement> NativeBottomRow(const Grid& keys) {
     std::vector<FrameworkElement> row;
     double bottomY = -1;
     for (const auto& item : keys.Children()) {
         const auto key = item.try_as<FrameworkElement>();
         if (!key || key.Visibility() != Visibility::Visible) continue;
         const double y = key.Margin().Top;
-        if (y > bottomY) {
+        if (y > bottomY + 0.5) {
             row.clear();
             bottomY = y;
         }
-        if (y == bottomY) row.push_back(key);
+        if (std::abs(y - bottomY) <= 0.5) row.push_back(key);
     }
-    if (row.size() < 3) return;
     std::sort(row.begin(), row.end(), [](const auto& a, const auto& b) { return a.Margin().Left < b.Margin().Left; });
-    const auto mic = row[1];
-    const auto enterLabel = FindNamed(row.back(), L"TEMPLATE_PART_KeyLabel").try_as<TextBlock>();
-    if (!FindNamed(mic, L"TEMPLATE_PART_DictationKeyControl") ||
-        !enterLabel || enterLabel.Text() != L"\uE751") return;
+    return row;
+}
 
-    // Compact native keys have explicit widths and left margins. Move the
-    // intervening keys by one slot and keep Enter's right edge in place.
+void WidenNativeEnter(const Grid& keys) {
+    const auto row = NativeBottomRow(keys);
+    const bool hasMic = row.size() >= 3 && FindNamed(row[1], L"TEMPLATE_PART_DictationKeyControl");
+    const auto enterLabel = row.size() >= 3 ? FindNamed(row.back(), L"TEMPLATE_PART_KeyLabel").try_as<TextBlock>() : nullptr;
+    const bool eligible = hasMic && enterLabel && enterLabel.Text() == L"";
+    // Keep a valid edit; drop it the moment the row is no longer the one edited.
+    if (g_hiddenMic) {
+        const bool current = eligible && row == g_editedRow &&
+            std::all_of(g_bottomRowEdits.begin(), g_bottomRowEdits.end(), [](const RenderEdit& edit) {
+                return edit.element.ReadLocalValue(edit.property) == edit.applied;
+            });
+        if (current) return;
+        RestoreNativeBottomRow();
+    }
+    if (!eligible) return;
+
+    const auto mic = row[1];
     const double shift = row[2].Margin().Left - mic.Margin().Left;
-    if (!std::isfinite(shift) || shift <= 0 || std::abs(shift - mic.Width()) > 2) return;
-    std::vector<NativeKeyPosition> positions;
-    for (size_t i = 2; i < row.size(); ++i) {
-        const auto& key = row[i];
-        const double left = key.Margin().Left;
-        const double width = key.Width();
-        if (key.HorizontalAlignment() != HorizontalAlignment::Left || !std::isfinite(width) || width <= 0)
-            return;
-        positions.push_back({key, left, left - shift, width, i + 1 == row.size() ? width + shift : width});
+    if (!std::isfinite(shift) || shift <= 0 || std::abs(shift - mic.ActualWidth()) > 2) return;
+    const auto& enter = row.back();
+    const auto enterFace = FindNamed(enter, L"TEMPLATE_PART_KeyBackgroundBorder");
+    const double faceWidth = enterFace ? enterFace.ActualWidth() : 0;
+    if (!enterFace || !std::isfinite(faceWidth) || faceWidth <= 0) return;
+
+    ApplyRenderEdit(mic, UIElement::OpacityProperty(), box_value(0.0));
+    ApplyRenderEdit(mic, UIElement::IsHitTestVisibleProperty(), box_value(false));
+    // Slide the keys between the microphone and Enter one slot left.
+    for (size_t i = 2; i + 1 < row.size(); ++i) {
+        Media::TranslateTransform move;
+        move.X(-shift);
+        ApplyRenderEdit(row[i], UIElement::RenderTransformProperty(), move);
     }
-    g_nativeKeyPositions = std::move(positions);
+    // Grow Enter's face leftward into the freed slot; keep its label centred.
+    Media::ScaleTransform grow;
+    grow.ScaleX((faceWidth + shift) / faceWidth);
+    ApplyRenderEdit(enterFace, UIElement::RenderTransformOriginProperty(),
+                    box_value(Windows::Foundation::Point{1, 0.5f}));
+    ApplyRenderEdit(enterFace, UIElement::RenderTransformProperty(), grow);
+    Media::TranslateTransform center;
+    center.X(-shift / 2);
+    ApplyRenderEdit(enterLabel, UIElement::RenderTransformProperty(), center);
     g_hiddenMic = mic;
-    mic.Visibility(Visibility::Collapsed);
-    for (const auto& position : g_nativeKeyPositions) {
-        auto margin = position.key.Margin();
-        margin.Left = position.appliedLeft;
-        position.key.Margin(margin);
-        if (position.originalWidth != position.appliedWidth) position.key.Width(position.appliedWidth);
-    }
+    g_editedRow = row;
 }
 
 struct ModifierSlide {
@@ -2664,12 +2514,12 @@ static void AttachModifierSlide(const Button& button, WORD modifier, ModifierSli
             const auto gesture = std::exchange(g_modifierSlide, {});
             ClearModifierTrail();
             NotifyModifierReleased();
-            if (!MicAsCtrl::g_enabled || !CompactModeActive() ||
+            if (!FooterKeys::g_enabled || !CompactModeActive() ||
                 (modifier == VK_LWIN && GetTickCount64() - gesture.started < kFooterHoldMs)) return;
             try {
                 if (const WORD destination = SlideDestination(args)) {
                     args.Handled(true);
-                    MicAsCtrl::SendFooterChord({{modifier, destination}, 2});
+                    FooterKeys::SendFooterChord({{modifier, destination}, 2});
                 }
             } catch (const hresult_error&) {
                 VLOG(L"Compact keys: could not resolve modifier slide destination");
@@ -2709,7 +2559,7 @@ void RemoveRow() {
     RestoreNativeBottomRow();
     if (!g_strip) return;
     g_rowNeedsRemoval = true;
-    MicAsCtrl::ClearAdapter();
+    FooterKeys::ClearAdapter();
     g_modifierSlide = {};
     ClearModifierTrail();
     if (g_button) {
@@ -2741,39 +2591,7 @@ void RemoveRow() {
     }
     g_heldFooterKey = 0;
     uint32_t index = 0;
-    if (g_sideSurface) {
-        if (g_sideHost.Children().IndexOf(g_sideSurface, index)) g_sideHost.Children().RemoveAt(index);
-        if (g_sideColumn) {
-            const auto columns = g_sideHost.ColumnDefinitions();
-            if (columns.Size() && columns.GetAt(columns.Size() - 1) == g_sideColumn)
-                columns.RemoveAtEnd();
-            g_sideColumn = nullptr;
-        }
-        if (g_nativeStarColumn) {
-            g_nativeStarColumn.Width(g_nativeStarWidth);
-            g_nativeStarColumn = nullptr;
-            if (g_nativePanelWidth == DependencyProperty::UnsetValue())
-                g_sideHost.ClearValue(FrameworkElement::WidthProperty());
-            else
-                g_sideHost.SetValue(FrameworkElement::WidthProperty(), g_nativePanelWidth);
-            g_nativePanelWidth = nullptr;
-        }
-        if (g_sideOuterFrame) {
-            const auto property = FrameworkElement::WidthProperty();
-            if (g_sideOuterWidth == DependencyProperty::UnsetValue())
-                g_sideOuterFrame.ClearValue(property);
-            else
-                g_sideOuterFrame.SetValue(property, g_sideOuterWidth);
-            g_sideOuterFrame = nullptr;
-            g_sideOuterWidth = nullptr;
-        }
-        g_probeWindowLogged = false;
-        g_probeCompositionLogged = false;
-        RestoreSideAncestors();
-        RestoreSideWindow();
-        g_sideSurface = nullptr;
-        g_sideHost = nullptr;
-    } else if (g_panel.Children().IndexOf(g_strip, index)) {
+    if (g_panel && g_panel.Children().IndexOf(g_strip, index)) {
         g_panel.Children().RemoveAt(index);
     }
     if (g_footer) {
@@ -2964,6 +2782,35 @@ static void UpdateInjectedKeyTheme(const FrameworkElement& panel, const Framewor
     }
 }
 
+// Pick the face whose resting style the injected keys copy. A hovered or
+// pressed key swaps its background brush, so copying one live key spreads its
+// hover state. Vote instead: the most common background is the letter style,
+// the next most common is the function-key style (Shift, Backspace, &123...).
+// A single hovered key forms its own minority and never wins. The accent
+// Enter is skipped because this mod recolors it.
+static Border FunctionKeyFace(const Grid& keys, const Border& fallback) {
+    struct Style { UINT32 color; Border face; int votes; };
+    std::vector<Style> styles;
+    for (const auto& child : keys.Children()) {
+        const auto key = child.try_as<FrameworkElement>();
+        if (!key || key.Visibility() != Visibility::Visible) continue;
+        const auto face = FindNamed(key, L"TEMPLATE_PART_KeyBackgroundBorder").try_as<Border>();
+        if (!face || face == g_enterFace) continue;
+        Windows::UI::Color color{};
+        const auto brush = face.Background();
+        if (const auto solid = brush.try_as<Media::SolidColorBrush>()) color = solid.Color();
+        else if (const auto acrylic = brush.try_as<Media::AcrylicBrush>()) color = acrylic.FallbackColor();
+        else continue;
+        const UINT32 packed = (UINT32{color.A} << 24) | (color.R << 16) | (color.G << 8) | color.B;
+        auto it = std::find_if(styles.begin(), styles.end(), [&](const Style& s) { return s.color == packed; });
+        if (it == styles.end()) styles.push_back({packed, face, 1});
+        else ++it->votes;
+    }
+    std::stable_sort(styles.begin(), styles.end(), [](const Style& a, const Style& b) { return a.votes > b.votes; });
+    if (styles.size() >= 2 && styles[1].votes >= 2) return styles[1].face;
+    return fallback;
+}
+
 void MatchKeyFace(const Button& button, const Border& face, bool primed) {
     TRACE_SCOPE();
     if (!face) return;
@@ -2985,11 +2832,15 @@ struct NativeKeyRow {
     double bottom = 0;
     double precedingBottom = std::numeric_limits<double>::lowest();
     Border face{nullptr};
+    // The most common key face width. The bottom row starts with a wider
+    // mode key in some layouts (abc, &123), so it cannot be the reference.
+    double keyWidth = 0;
 };
 
 NativeKeyRow MeasureBottomRow(const Grid& keys, const UIElement& relativeTo) {
     TRACE_SCOPE();
     NativeKeyRow row;
+    std::vector<long> widths;
     for (const auto& child : keys.Children()) {
         TRACE_BLOCK();
         const auto key = child.try_as<FrameworkElement>();
@@ -3001,6 +2852,7 @@ NativeKeyRow MeasureBottomRow(const Grid& keys, const UIElement& relativeTo) {
             {0, 0, static_cast<float>(face.ActualWidth()), static_cast<float>(face.ActualHeight())});
         const double keyBottom = bounds.Y + bounds.Height;
         const double keyRight = bounds.X + bounds.Width;
+        if (bounds.Width > 0) widths.push_back(std::lround(bounds.Width * 2));
         if (!row.first.Width || keyBottom > row.bottom + 2) {
             TRACE_BLOCK();
             if (row.first.Width) row.precedingBottom = row.bottom;
@@ -3019,6 +2871,15 @@ NativeKeyRow MeasureBottomRow(const Grid& keys, const UIElement& relativeTo) {
         } else {
             TRACE_BLOCK();
             row.precedingBottom = std::max(row.precedingBottom, keyBottom);
+        }
+    }
+    std::sort(widths.begin(), widths.end());
+    size_t best = 0;
+    for (size_t i = 0, j; i < widths.size(); i = j) {
+        for (j = i; j < widths.size() && widths[j] - widths[i] <= 2; ++j) {}
+        if (j - i > best) {
+            best = j - i;
+            row.keyWidth = widths[i] / 2.0;
         }
     }
     return row;
@@ -3064,7 +2925,7 @@ void RefreshRow(HWND hwnd) {
         Grid::GetRowSpan(keyboard) == 1 && panel.RowDefinitions().Size() == 9;
     PublishCompactMode(compact);
     if (!compact) {
-        MicAsCtrl::t_shortcut = {};
+        FooterKeys::t_shortcut = {};
         g_swipeKeyWidth.store(0, std::memory_order_relaxed);
         RemoveRow();
     }
@@ -3090,19 +2951,8 @@ void RefreshRow(HWND hwnd) {
     }
     g_swipeKeyWidth.store(swipeKeyWidth, std::memory_order_relaxed);
     if (!visible && g_repeatingArrow) StopArrowRepeat(hwnd);
-    const bool right = ReadSettings().extraKeysOnRight;
     const double reserve = g_footerReserveDip.load();
-    const auto sideHost = right ? panel : nullptr;
-    FrameworkElement outerFrame{nullptr};
-    for (DependencyObject ancestor = sideHost; ancestor; ancestor = VisualTreeHelper::GetParent(ancestor)) {
-        if (auto element = ancestor.try_as<FrameworkElement>(); element && element.Name() == L"InputPanelControl") {
-            outerFrame = element;
-            break;
-        }
-    }
-    if (!MicAsCtrl::g_enabled || !root || !panel ||
-        panel.Name() != L"TEMPLATE_PART_InputPanelGrid" || count < 33 || count > 38 ||
-        (right ? !visible || !outerFrame || outerFrame.ActualWidth() <= 0 : reserve <= 0) ||
+    if (!FooterKeys::g_enabled || !root || !panel || reserve <= 0 ||
         !std::isfinite(keyboard.ActualWidth()) || keyboard.ActualWidth() <= 0 ||
         !std::isfinite(keyboard.ActualHeight()) || keyboard.ActualHeight() <= 16 ||
         keyboard.Visibility() != Visibility::Visible) {
@@ -3119,7 +2969,7 @@ void RefreshRow(HWND hwnd) {
         return;
     }
     const auto footer = rows.GetAt(footerIndex);
-    if (g_button && (keyboard != g_keyboard || panel != g_panel || footer != g_footer || sideHost != g_sideHost)) RemoveRow();
+    if (g_button && (keyboard != g_keyboard || panel != g_panel || footer != g_footer)) RemoveRow();
     if (!g_button) {
         TRACE_BLOCK();
         const auto stockHeight = footer.Height();
@@ -3135,7 +2985,7 @@ void RefreshRow(HWND hwnd) {
         AttachModifierSlide(button, VK_CONTROL, g_ctrlSlideHandlers);
         const auto click = button.Click([hwnd](auto&&, auto&&) {
             TraceScope traceScope("Ctrl Click callback", __LINE__);
-            if (MicAsCtrl::g_enabled && CompactModeActive()) MicAsCtrl::ToggleModifier(VK_CONTROL);
+            if (FooterKeys::g_enabled && CompactModeActive()) FooterKeys::ToggleModifier(VK_CONTROL);
             if (!g_stopping && !g_refreshQueued) g_refreshQueued = PostMessage(hwnd, kRefresh, 0, 0);
         });
 
@@ -3199,31 +3049,31 @@ void RefreshRow(HWND hwnd) {
             if (key.vk == VK_MENU) AttachModifierSlide(key.button, VK_MENU, g_altSlideHandlers);
             key.click = key.button.Click([hwnd, vk = key.vk, clipboardKey](auto&&, auto&&) {
                 TraceScope traceScope("Footer Key Click callback", __LINE__);
-                if (!MicAsCtrl::g_enabled || !CompactModeActive()) return;
+                if (!FooterKeys::g_enabled || !CompactModeActive()) return;
                 const bool held = vk == std::exchange(g_heldFooterKey, 0) &&
                                   GetTickCount64() - g_footerPressedAt >= kFooterHoldMs;
                 if (held && (vk == VK_LWIN || vk == VK_TAB)) {
-                    MicAsCtrl::ToggleModifier(vk);
+                    FooterKeys::ToggleModifier(vk);
                 } else if (vk == VK_LWIN) {
-                    MicAsCtrl::t_shortcut = {};
+                    FooterKeys::t_shortcut = {};
                     SendShortcut({{VK_LWIN}, 1});
                 } else if (vk == VK_BROWSER_BACK || vk == VK_BROWSER_FORWARD) {
-                    MicAsCtrl::t_shortcut = {};
+                    FooterKeys::t_shortcut = {};
                     const WORD arrow = vk == VK_BROWSER_BACK ? VK_LEFT : VK_RIGHT;
                     SendShortcut({{VK_MENU, arrow}, 2});
                 } else if (vk == VK_SNAPSHOT) {
-                    MicAsCtrl::t_shortcut = {};
+                    FooterKeys::t_shortcut = {};
                     SendShortcut({{VK_LWIN, VK_SNAPSHOT}, 2});
                 } else if (vk == kSpecialShortcutKey || clipboardKey) {
                     const auto chord = clipboardKey ? Settings::ShortcutChord{{VK_CONTROL, vk}, 2}
                                                     : ReadSettings().specialKey;
-                    MicAsCtrl::t_shortcut = {};
+                    FooterKeys::t_shortcut = {};
                     if (chord.count) {
                         VLOG(L"Compact shortcut: sending footer chord for key 0x%02X", static_cast<unsigned>(vk));
-                        MicAsCtrl::SendFooterChord(chord);
+                        FooterKeys::SendFooterChord(chord);
                     } else Wh_Log(L"Compact shortcut: the configured ★ shortcut is invalid or reserved by Windows");
-                } else if (vk == VK_MENU) MicAsCtrl::ToggleModifier(VK_MENU);
-                else MicAsCtrl::PressFooterKey(vk);
+                } else if (vk == VK_MENU) FooterKeys::ToggleModifier(VK_MENU);
+                else FooterKeys::PressFooterKey(vk);
                 if (!g_stopping && !g_refreshQueued) g_refreshQueued = PostMessage(hwnd, kRefresh, 0, 0);
             });
             strip.Children().Append(key.button);
@@ -3240,40 +3090,7 @@ void RefreshRow(HWND hwnd) {
         g_appliedFooterHeight = stockHeight.Value;
         std::move(footerKeys.begin(), footerKeys.end(), std::begin(g_footerKeys));
         g_rowNeedsRemoval = true;
-        if (right) {
-            Border surface;
-            surface.HorizontalAlignment(HorizontalAlignment::Left);
-            surface.VerticalAlignment(VerticalAlignment::Top);
-            if (auto frame = FindNamed(panel, L"TEMPLATE_PART_InputPanelBackground").try_as<Border>())
-                surface.Background(frame.Background());
-            surface.CornerRadius({8, 8, 8, 8});
-            surface.Child(strip);
-            g_sideHost = sideHost;
-            g_sideSurface = surface;
-            const auto columns = sideHost.ColumnDefinitions();
-            if (columns.Size() != 7 || columns.GetAt(3).Width().GridUnitType != GridUnitType::Star ||
-                columns.GetAt(3).ActualWidth() <= 0) {
-                RemoveRow();
-                return;
-            }
-            g_stockPanelWidth = sideHost.ActualWidth();
-            g_stockOuterWidth = outerFrame.ActualWidth();
-            g_sideOuterWidth = outerFrame.ReadLocalValue(FrameworkElement::WidthProperty());
-            g_sideOuterFrame = outerFrame;
-            g_nativePanelWidth = sideHost.ReadLocalValue(FrameworkElement::WidthProperty());
-            g_nativeStarColumn = columns.GetAt(3);
-            g_nativeStarWidth = g_nativeStarColumn.Width();
-            g_nativeStarColumn.Width({g_nativeStarColumn.ActualWidth(), GridUnitType::Pixel});
-            g_sideColumn = ColumnDefinition();
-            g_sideColumn.Width({0, GridUnitType::Pixel});
-            Canvas::SetZIndex(surface, 1000);
-            Grid::SetColumn(surface, static_cast<int>(columns.Size()));
-            Grid::SetRowSpan(surface, static_cast<int>(rows.Size()));
-            columns.Append(g_sideColumn);
-            sideHost.Children().Append(surface);
-        } else {
-            panel.Children().Append(strip);
-        }
+        panel.Children().Append(strip);
         g_rowNeedsRemoval = false;
         Wh_Log(L"Compact key row: added shortcut keys and arrows to native keyboard panel");
     }
@@ -3282,8 +3099,8 @@ void RefreshRow(HWND hwnd) {
     ColorNativeEnter(keys);
     if (ReadSettings().hideVoiceTypingButton) WidenNativeEnter(keys);
     else if (g_hiddenMic) RestoreNativeBottomRow();
-    const auto row = MeasureBottomRow(keys, right ? UIElement(sideHost) : UIElement(g_strip));
-    const double keyWidth = row.first.Width;
+    const auto row = MeasureBottomRow(keys, g_strip);
+    const double keyWidth = row.keyWidth > 0 ? row.keyWidth : row.first.Width;
     const double keyHeight = row.first.Height;
     if (keyWidth <= 0 || keyHeight <= 0) {
         TRACE_BLOCK();
@@ -3300,7 +3117,7 @@ void RefreshRow(HWND hwnd) {
     // The stock frame's bottom inset is about 18 px at the reference scale.
     const double bottomInset = 18 * screenshotPixel;
     const double lowerRowTop = top + keyHeight + gap;
-    const double footerHeight = right ? g_stockFooterHeight.Value : std::min(g_stockFooterHeight.Value + reserve, lowerRowTop + keyHeight + bottomInset);
+    const double footerHeight = std::min(g_stockFooterHeight.Value + reserve, lowerRowTop + keyHeight + bottomInset);
     if (footer.MaxHeight() < footerHeight) footer.MaxHeight(footerHeight);
     if (footer.Height().Value != footerHeight) footer.Height({footerHeight, GridUnitType::Pixel});
     if (footer.MinHeight() != footerHeight) footer.MinHeight(footerHeight);
@@ -3313,62 +3130,8 @@ void RefreshRow(HWND hwnd) {
 
     const double arrowSpacing = gap;
     const double arrowLeft = row.right - 3 * keyWidth - 2 * arrowSpacing;
-    const double pitch = keyWidth + gap;
-    const double sideLeft = gap;
-    const double sideTop = gap;
-    bool sideFits = false;
-    if (right) {
-        const double width = 5 * keyWidth + 6 * gap;
-        const double height = 4 * keyHeight + 5 * gap;
-        const double columnWidth = width + 2 * gap;
-        const double y = std::max(0.0, row.bottom + 2 * gap - height);
-        if (g_strip.Width() != width) g_strip.Width(width);
-        if (g_strip.Height() != height) g_strip.Height(height);
-        if (g_sideColumn.Width().Value != columnWidth) g_sideColumn.Width({columnWidth, GridUnitType::Pixel});
-        const double panelWidth = g_stockPanelWidth + columnWidth;
-        const double outerWidth = g_stockOuterWidth + columnWidth;
-        if (g_sideOuterFrame.Width() != outerWidth) g_sideOuterFrame.Width(outerWidth);
-        if (sideHost.Width() != panelWidth) sideHost.Width(panelWidth);
-        ExpandSideAncestors(g_sideOuterFrame, outerWidth);
-        ResizeSideWindow(window, outerWidth);
-        if (g_sideWindow && !g_probeWindowLogged) {
-            g_probeWindowLogged = true;
-            if (const HRGN region = CreateRectRgn(0, 0, 0, 0)) {
-                const int kind = GetWindowRgn(g_sideWindow, region);
-                RECT bounds{};
-                if (kind != ERROR) GetRgnBox(region, &bounds);
-                Wh_Log(L"Compact clip probe: HWND region kind=%d bounds=(%ld,%ld)-(%ld,%ld)",
-                       kind, bounds.left, bounds.top, bounds.right, bounds.bottom);
-                DeleteObject(region);
-            }
-        }
-        const Thickness placement{gap, y, 0, 0};
-        if (g_sideSurface.Margin() != placement) g_sideSurface.Margin(placement);
-        sideFits = panelWidth <= sideHost.ActualWidth() + 0.5 &&
-                   y + height <= sideHost.ActualHeight() + 0.5;
-        if (sideFits && !g_probeCompositionLogged && g_sideSurface.ActualWidth() > 0) {
-            g_probeCompositionLogged = true;
-            LogSideCompositionClips(g_sideSurface);
-            int depth = 0;
-            for (HWND host = g_sideWindow; host && depth < 16; host = GetAncestor(host, GA_PARENT), ++depth) {
-                RECT windowRect{}, clientRect{};
-                if (!GetWindowRect(host, &windowRect) || !GetClientRect(host, &clientRect)) continue;
-                MapWindowPoints(host, nullptr, reinterpret_cast<POINT*>(&clientRect), 2);
-                wchar_t windowClass[128]{};
-                GetClassNameW(host, windowClass, ARRAYSIZE(windowClass));
-                Wh_Log(L"Compact clip probe: HWND ancestor %d %p %s dpi=%u window=(%ld,%ld)-(%ld,%ld) client=(%ld,%ld)-(%ld,%ld)",
-                       depth, host, windowClass, GetDpiForWindow(host),
-                       windowRect.left, windowRect.top, windowRect.right, windowRect.bottom,
-                       clientRect.left, clientRect.top, clientRect.right, clientRect.bottom);
-                if (!(GetWindowLongPtrW(host, GWL_STYLE) & WS_CHILD)) break;
-            }
-        }
-        const auto visibility = sideFits ? Visibility::Visible : Visibility::Collapsed;
-        if (g_sideSurface.Visibility() != visibility) g_sideSurface.Visibility(visibility);
-    }
-    const bool fits = right ? sideFits : (keyWidth > 0 && keyHeight > 0 && row.first.X >= 0 &&
-                      arrowLeft >= row.first.X + keyWidth + arrowSpacing &&
-                      lowerRowTop + keyHeight <= g_strip.ActualHeight() + 0.5);
+    const bool fits = row.first.X >= 0 && arrowLeft >= row.first.X + keyWidth + arrowSpacing &&
+                      lowerRowTop + keyHeight <= g_strip.ActualHeight() + 0.5;
     if (g_strip.IsHitTestVisible() != fits) g_strip.IsHitTestVisible(fits);
     if (g_strip.Opacity() != (fits ? 1.0 : 0.0)) g_strip.Opacity(fits ? 1.0 : 0.0);
     if (!fits) return;
@@ -3381,11 +3144,12 @@ void RefreshRow(HWND hwnd) {
         if (button.Height() != height) button.Height(height);
         if (button.FontSize() != font) button.FontSize(font);
     };
-    setGeometry(g_button, right ? sideLeft : row.first.X, right ? sideTop : top, keyWidth, keyHeight, keyHeight * 0.36);
+    setGeometry(g_button, row.first.X, top, keyWidth, keyHeight, keyHeight * 0.36);
     const auto foreground = GetForegroundWindow();
-    if (!MicAsCtrl::AdapterMatchesInput(foreground)) MicAsCtrl::ClearAdapter();
-    const auto modifier = MicAsCtrl::ShortcutMatchesInput(foreground) ? MicAsCtrl::t_shortcut.modifier : 0;
-    MatchKeyFace(g_button, row.face, modifier == VK_CONTROL || g_modifierSlide.modifier == VK_CONTROL);
+    if (!FooterKeys::AdapterMatchesInput(foreground)) FooterKeys::ClearAdapter();
+    const auto modifier = FooterKeys::ShortcutMatchesInput(foreground) ? FooterKeys::t_shortcut.modifier : 0;
+    const auto referenceFace = FunctionKeyFace(keys, row.face);
+    MatchKeyFace(g_button, referenceFace, modifier == VK_CONTROL || g_modifierSlide.modifier == VK_CONTROL);
     const double specialSpacing = gap;
     const double leftGroupRight = row.first.X + 3 * keyWidth + 2 * specialSpacing;
 
@@ -3393,26 +3157,9 @@ void RefreshRow(HWND hwnd) {
         (arrowLeft - leftGroupRight - specialSpacing) / 4 - specialSpacing);
     for (const auto& key : g_footerKeys) {
         TRACE_BLOCK();
-        MatchKeyFace(key.button, row.face, (modifier && key.vk == modifier) ||
+        MatchKeyFace(key.button, referenceFace, (modifier && key.vk == modifier) ||
                      (g_modifierSlide.modifier && key.vk == g_modifierSlide.modifier));
-        if (right) {
-            // The last two rows keep Home / Up / End above Left / Down / Right.
-            constexpr WORD sideKeys[4][5] = {
-                {VK_CONTROL, VK_LWIN, VK_MENU, VK_TAB, VK_APPS},
-                {'A', 'C', 'V', kSpecialShortcutKey, VK_ESCAPE},
-                {VK_DELETE, VK_SNAPSHOT, VK_HOME, VK_UP, VK_END},
-                {VK_BROWSER_BACK, VK_BROWSER_FORWARD, VK_LEFT, VK_DOWN, VK_RIGHT},
-            };
-            if (key.button.Visibility() != Visibility::Visible) key.button.Visibility(Visibility::Visible);
-            for (int y = 0; y < 4; ++y) {
-                for (int x = 0; x < 5; ++x) {
-                    if (sideKeys[y][x] != key.vk) continue;
-                    setGeometry(key.button, sideLeft + x * pitch, sideTop + y * (keyHeight + gap),
-                                keyWidth, keyHeight, key.hasIcon ? keyHeight * 0.36 :
-                                std::min(keyHeight * 0.30, keyWidth * 0.31));
-                }
-            }
-        } else if (key.row == -2) {
+        if (key.row == -2) {
             setGeometry(key.button, row.first.X + key.column * (keyWidth + specialSpacing),
                         top, keyWidth, keyHeight,
                         key.hasIcon || key.vk == kSpecialShortcutKey ? keyHeight * 0.36 :
@@ -3441,7 +3188,7 @@ void RefreshRow(HWND hwnd) {
 LRESULT CALLBACK UiWindowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     TRACE_SCOPE();
     if (message == WM_TIMER && wp == kArrowRepeat) {
-        if (!g_repeatingArrow || g_stopping || !MicAsCtrl::g_enabled || !CompactModeActive()) {
+        if (!g_repeatingArrow || g_stopping || !FooterKeys::g_enabled || !CompactModeActive()) {
             StopArrowRepeat(hwnd);
             return 0;
         }
@@ -3452,7 +3199,7 @@ LRESULT CALLBACK UiWindowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
             if (!SetTimer(hwnd, kArrowRepeat, interval, nullptr)) StopArrowRepeat(hwnd);
             else g_arrowRepeatStarted = true;
         }
-        if (g_repeatingArrow) MicAsCtrl::PressFooterKey(g_repeatingArrow);
+        if (g_repeatingArrow) FooterKeys::PressFooterKey(g_repeatingArrow);
         return 0;
     }
     if (message == kRefresh || (message == WM_TIMER && wp == kWatchdog)) {
@@ -3498,7 +3245,7 @@ LRESULT CALLBACK UiWindowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
             g_removing = false;
             return 0;
         }
-        MicAsCtrl::ClearAdapter();
+        FooterKeys::ClearAdapter();
         if (!DestroyWindow(hwnd)) {
             TRACE_BLOCK();
             g_removing = false;
@@ -3537,7 +3284,7 @@ LRESULT WINAPI DispatchMessage_hook(const MSG* message) {
                                          HWND_MESSAGE, nullptr, wc.hInstance, nullptr);
         if (hwnd && SetTimer(hwnd, kWatchdog, kWatchdogMs, nullptr)) {
             TRACE_BLOCK();
-            MicAsCtrl::g_arrowUiThread = GetCurrentThreadId();
+            FooterKeys::g_arrowUiThread = GetCurrentThreadId();
             g_uiWindow = hwnd;
             g_refreshQueued = PostMessage(hwnd, kRefresh, 0, 0);
         } else {
@@ -3559,7 +3306,7 @@ void Stop() {
         TRACE_BLOCK();
         std::lock_guard lock(g_uiRegistrationMutex);
         g_stopping = true;
-        MicAsCtrl::g_arrowUiThread = 0;
+        FooterKeys::g_arrowUiThread = 0;
         hwnd = g_uiWindow;
     }
     if (!hwnd) return;
@@ -3585,8 +3332,8 @@ void Stop() {
 
 bool HookTextInput(HMODULE mod) {
     TRACE_SCOPE();
-    const bool knownImage = MatchesImage(mod, kTextInputImages);
-    g_swipeThresholdLayoutVerified = knownImage;
+    const bool offsetsVerified = MatchesImage(mod, kVerifiedOffsetImages);
+    g_swipeThresholdLayoutVerified = offsetsVerified;
     WindhawkUtils::SYMBOL_HOOK hooks[] = {
         {{L"private: void __cdecl " TIU L"ShellViewPositionAndSizeManager::PrimaryViewTryHide(class Platform::String ^)"},
          &PrimaryViewTryHide_orig, PrimaryViewTryHide_hook, true},
@@ -3609,10 +3356,8 @@ bool HookTextInput(HMODULE mod) {
         {{L"public: virtual class " TIC L"SizePositionInfo __cdecl " TIU L"Controls::WideNarrowSizePositionManager::CalculateDesiredSize(void)"},
          &WNCalcDesiredSize_orig, WNCalcDesiredSize_hook, true},
     };
-    // The private layout-dependent size hook is last.
-    const size_t count = ARRAYSIZE(hooks) - (knownImage ? 0 : 1);
-    bool ok = WindhawkUtils::HookSymbols(mod, hooks, count);
-    if (ok && knownImage) {
+    bool ok = WindhawkUtils::HookSymbols(mod, hooks, ARRAYSIZE(hooks));
+    if (ok && offsetsVerified) {
         WindhawkUtils::SYMBOL_HOOK hideHooks[] = {
             {{L"public: virtual void __cdecl " TIU L"ShellViewPositionAndSizeManager::[" TIC L"IViewPositionAndSizeManager]::TryHide(void)",
               L"public: void __cdecl " TIU L"ShellViewPositionAndSizeManager::[" TIC L"IViewPositionAndSizeManager]::TryHide(void)"},
@@ -3625,8 +3370,8 @@ bool HookTextInput(HMODULE mod) {
     Wh_Log(L"TextInput hooks %s", ok ? L"ok" : L"FAILED");
     if (!TextFrameworkFocusChanged_orig) Wh_Log(L"Compact keys: native focus adapter hook unavailable");
     if (!SwipeStartDistance_orig || !g_swipeThresholdLayoutVerified) Wh_Log(L"Positive custom swipe-start distances unavailable on this TextInput build");
-    if (ok && knownImage) MicAsCtrl::Install(mod);
-    if (!knownImage) Wh_Log(L"Unrecognized TextInput image; leaving private layout and key-action features off");
+    if (ok) FooterKeys::Install(mod);
+    if (!offsetsVerified) Wh_Log(L"TextInput build not offset-verified; auto-dismiss caller filter and custom swipe-start distance off");
     if (!Wh_SetFunctionHook(reinterpret_cast<void*>(DispatchMessageW),
                             reinterpret_cast<void*>(CompactCtrlRow::DispatchMessage_hook),
                             reinterpret_cast<void**>(&CompactCtrlRow::g_dispatchMessage))) {
@@ -3725,7 +3470,9 @@ static void PublishHookReadiness() {
     g_sizeReady = g_text.configured && WNCalcDesiredSize_orig;
     g_appReady = g_app.configured && InputContext_IsImmContext_orig && CompositeContext_IsImmContext_orig &&
                  InputContext_IsWritingSuggestionsDisabled_orig && CompositeContext_IsWritingSuggestionsDisabled_orig;
-    MicAsCtrl::g_enabled = g_text.configured && MicAsCtrl::g_configured;
+    // The extra rows need only XAML and SendInput. The native key-action
+    // hooks add sticky Ctrl/Alt for native keys when they resolve.
+    FooterKeys::g_enabled = g_text.configured;
 }
 
 static void RegisterLoadedModules() {
@@ -3780,7 +3527,6 @@ void LoadSettings() {
     std::lock_guard lock(g_settingsWriter);
     if (g_unloading) return;
     Settings settings;
-    settings.extraKeysOnRight = Wh_GetIntSetting(L"extraKeysOnRight");
     settings.hideVoiceTypingButton = Wh_GetIntSetting(L"hideVoiceTypingButton");
     settings.noAutoHide = Wh_GetIntSetting(L"noAutoHide");
     settings.bubbleOnClose = Wh_GetIntSetting(L"bubbleOnClose");
@@ -3789,8 +3535,6 @@ void LoadSettings() {
     settings.customSwipeStartDistance = Wh_GetIntSetting(L"noSwipeStartDistance");
     settings.swipeStartDistancePercent = std::clamp(Wh_GetIntSetting(L"swipeStartDistancePercent"), 0, 200);
     settings.forceSwipe = Wh_GetIntSetting(L"forceSwipe");
-    settings.scale = Wh_GetIntSetting(L"scale");
-    if (settings.scale < 50 || settings.scale > 200) settings.scale = 100;
     settings.horizontalScale = Wh_GetIntSetting(L"horizontalScale");
     if (settings.horizontalScale < 50 || settings.horizontalScale > 200) settings.horizontalScale = 100;
     if (PCWSTR shortcut = Wh_GetStringSetting(L"specialKey")) {
@@ -3878,7 +3622,7 @@ void Wh_ModBeforeUninit() {
         PublishSettings(Settings{});
     }
     std::lock_guard lock(g_moduleMutex);
-    MicAsCtrl::g_enabled = false;
+    FooterKeys::g_enabled = false;
 }
 
 void Wh_ModUninit() {
