@@ -1907,6 +1907,75 @@ void NotifyModifierReleased();
 namespace FooterKeys {
 extern std::atomic<bool> g_enabled;
 }
+// --- frame size actually applied ---
+// The rows need room the native frame only has once the shell applies the
+// enlarged size. ShellViewPositionAndSizeManager::TrySetPositionAndSize is
+// where the keyboard hands a SizePositionInfo (same layout as above) to the
+// shell; the rows are revealed only when the applied view height includes
+// the reserve requested in CalculateDesiredSize. Event-driven, no timers.
+namespace FrameSize {
+std::atomic<float> g_wantedView{0};   // view height requested with the reserve
+std::atomic<float> g_appliedView{0};  // view height last handed to the shell
+// Two native paths hand a size to the shell: TrySetPositionAndSize for
+// resizes, and GetPlacement, which packages the size into the show placement.
+using Apply_t = void(__cdecl*)(void* self, const void* info);
+using Placement_t = void*(__cdecl*)(void* self, const void* info);
+void* g_applyTarget;
+void* g_placementTarget;
+Apply_t g_apply;
+Placement_t g_placement;
+
+void Observe(std::wstring_view decorated, void* address) {
+    // The primary vtable entry, not the WBI adjustor thunk.
+    if (decorated == L"?TrySetPositionAndSize@?QIViewPositionAndSizeManager@Common@TextInput@Experiences@"
+                     L"ComposableShell@WindowsInternal@@ShellViewPositionAndSizeManager@TextInputUndocked@456@"
+                     L"UE$AAAXVSizePositionInfo@23456@@Z")
+        g_applyTarget = address;
+    else if (decorated.starts_with(L"?GetPlacement@ShellViewPositionAndSizeManager@TextInputUndocked@") &&
+             decorated.find(L"AEAVSizePositionInfo@") != std::wstring_view::npos)
+        g_placementTarget = address;
+}
+
+static void Record(const void* info, PCWSTR path) {
+    if (!info || g_unloading) return;
+    float view[2];
+    std::memcpy(view, static_cast<const BYTE*>(info) + sizeof(int), sizeof(view));
+    if (!std::isfinite(view[1]) || view[1] <= 0 || view[1] >= 100000) return;
+    g_appliedView.store(view[1]);
+    VLOG(L"Frame size %s: view %.1fx%.1f (rows want %.1f)", path, view[0], view[1], g_wantedView.load());
+    CompactCtrlRow::NotifyModifierReleased();  // posts a row refresh
+}
+
+// SizePositionInfo is passed by value, so the callee gets a pointer to a copy.
+void __cdecl Apply_hook(void* self, const void* info) {
+    Record(info, L"applied");
+    g_apply(self, info);
+}
+
+// Takes SizePositionInfo by reference; the placement it returns carries it.
+void* __cdecl Placement_hook(void* self, const void* info) {
+    Record(info, L"placed");
+    return g_placement(self, info);
+}
+
+bool Install() {
+    const bool apply = g_applyTarget && Wh_SetFunctionHook(g_applyTarget, reinterpret_cast<void*>(Apply_hook),
+                                                           reinterpret_cast<void**>(&g_apply));
+    const bool placement = g_placementTarget &&
+        Wh_SetFunctionHook(g_placementTarget, reinterpret_cast<void*>(Placement_hook),
+                           reinterpret_cast<void**>(&g_placement));
+    return apply && placement;
+}
+}  // namespace FrameSize
+
+// Whether the shell frame currently has room for the rows. Without the apply
+// hook there is no signal, so the rows are shown as before.
+static bool FrameHasRowRoom() {
+    if (!FrameSize::g_apply) return true;
+    const float wanted = FrameSize::g_wantedView.load();
+    return wanted > 0 && FrameSize::g_appliedView.load() >= wanted - 1;
+}
+
 using CalcDesiredSize_t = void*(__cdecl*)(void* pThis, void* ret);
 CalcDesiredSize_t WNCalcDesiredSize_orig;
 void* __cdecl WNCalcDesiredSize_hook(void* pThis, void* ret) {
@@ -1950,6 +2019,7 @@ void* __cdecl WNCalcDesiredSize_hook(void* pThis, void* ret) {
         // View width, panel width, and the X / width pairs of each rectangle.
         for (const int index : {0, 2, 4, 6, 8, 10}) values[index] *= widthFactor;
     }
+    if (reserve > 0) FrameSize::g_wantedView.store(values[1]);
     if (g_footerReserveDip.exchange(reserve) != reserve)
         VLOG(L"Compact sizing: view %.1f -> %.1f DIP (%.1f DIP footer), width %d%%",
              viewHeight, values[1], reserve, settings.horizontalScale);
@@ -2353,6 +2423,7 @@ void Install(HMODULE module) {
         const std::wstring_view name = symbol.symbolDecorated;
         AutoHide::Observe(name, symbol.symbol, const_cast<void*>(symbol.address));
         KeySound::Observe(name, const_cast<void*>(symbol.address));
+        FrameSize::Observe(name, const_cast<void*>(symbol.address));
         if (symbol.symbol && wcsstr(symbol.symbol, L"Controls::DefaultPointerHandler::IsTraveledEnoughToStartShapewriting"))
             g_swipeFunction = symbol.address;
         if (name.starts_with(L"?ProcessKeyAction@DefaultKeyActionHandlerImpl@Controls@"))
@@ -2533,6 +2604,7 @@ GridLength g_stockFooterHeight{};
 double g_stockFooterMin;
 double g_stockFooterMax;
 double g_appliedFooterHeight;
+double g_knownStockFooter;  // stock footer height from the first insert
 
 FrameworkElement FindNamed(const DependencyObject& root, std::wstring_view name) {
     TRACE_SCOPE();
@@ -3252,6 +3324,19 @@ NativeKeyRow MeasureBottomRow(const Grid& keys, const UIElement& relativeTo) {
 constexpr ULONGLONG kRowGraceMs = 400;
 constexpr UINT_PTR kGraceTimer = 3;
 
+// Logs why the row is missing, once per change of reason.
+static void RowState(PCWSTR format, ...) {
+    static std::wstring last;
+    wchar_t text[400];
+    va_list args;
+    va_start(args, format);
+    vswprintf_s(text, format, args);
+    va_end(args);
+    if (last == text) return;
+    last = text;
+    Wh_Log(L"Compact row state: %s", text);
+}
+
 static bool HoldRowThroughGlitch(HWND hwnd) {
     if (!g_button || g_stopping) return false;
     const auto now = GetTickCount64();
@@ -3308,6 +3393,10 @@ void RefreshRow(HWND hwnd) {
         if (g_repeatingArrow) StopArrowRepeat(hwnd);
         return;
     }
+    if (!compact)
+        RowState(L"not compact (visible=%d panel=%s count=%u kbRow=%d span=%d rows=%u)", visible,
+                 panel ? panel.Name().c_str() : L"-", count, keyboard ? Grid::GetRow(keyboard) : -1,
+                 keyboard ? Grid::GetRowSpan(keyboard) : -1, panel ? panel.RowDefinitions().Size() : 0u);
     if (!compact && HoldRowThroughGlitch(hwnd)) return;
     PublishCompactMode(compact);
     if (!compact) {
@@ -3331,11 +3420,28 @@ void RefreshRow(HWND hwnd) {
     g_swipeKeyWidth.store(swipeKeyWidth, std::memory_order_relaxed);
     if (!visible && g_repeatingArrow) StopArrowRepeat(hwnd);
     const double reserve = g_footerReserveDip.load();
+    // Views inside the compact keyboard (emoji, clipboard) change its native
+    // geometry, so the size hook stops reserving room for the rows. The
+    // keyboard is still compact: park the row (hidden, footer at stock
+    // height) instead of tearing it down; the normal path below restores it
+    // as soon as the reserve returns.
+    if (reserve <= 0 && g_button && g_footer && FooterKeys::g_enabled) {
+        RowState(L"parked (no footer reserve in this view)");
+        if (g_strip.IsHitTestVisible()) g_strip.IsHitTestVisible(false);
+        if (g_strip.Opacity() != 0) g_strip.Opacity(0);
+        if (g_footer.Height().Value != g_stockFooterHeight.Value) g_footer.Height(g_stockFooterHeight);
+        if (g_footer.MinHeight() != g_stockFooterMin) g_footer.MinHeight(g_stockFooterMin);
+        if (g_footer.MaxHeight() != g_stockFooterMax) g_footer.MaxHeight(g_stockFooterMax);
+        g_appliedFooterHeight = g_stockFooterHeight.Value;
+        return;
+    }
     if (!FooterKeys::g_enabled || !root || !panel || reserve <= 0 ||
         !std::isfinite(keyboard.ActualWidth()) || keyboard.ActualWidth() <= 0 ||
         !std::isfinite(keyboard.ActualHeight()) || keyboard.ActualHeight() <= 16 ||
         keyboard.Visibility() != Visibility::Visible) {
         TRACE_BLOCK();
+        RowState(L"not ready (enabled=%d reserve=%.1f kb=%.1fx%.1f vis=%d)", FooterKeys::g_enabled.load(), reserve,
+                 keyboard.ActualWidth(), keyboard.ActualHeight(), keyboard.Visibility() == Visibility::Visible);
         if (!HoldRowThroughGlitch(hwnd)) RemoveRow();
         return;
     }
@@ -3344,13 +3450,30 @@ void RefreshRow(HWND hwnd) {
     const auto rows = panel.RowDefinitions();
     if (Grid::GetRow(keyboard) != footerIndex - 1 || Grid::GetRowSpan(keyboard) != 1 || rows.Size() != 9) {
         TRACE_BLOCK();
+        RowState(L"unexpected rows (kbRow=%d span=%d rows=%u)", Grid::GetRow(keyboard), Grid::GetRowSpan(keyboard), rows.Size());
         if (!HoldRowThroughGlitch(hwnd)) RemoveRow();
         return;
     }
     const auto footer = rows.GetAt(footerIndex);
-    if (g_button && (keyboard != g_keyboard || panel != g_panel || footer != g_footer)) RemoveRow();
+    if (g_button && (keyboard != g_keyboard || panel != g_panel || footer != g_footer)) {
+        RowState(L"native elements replaced (keyboard=%d panel=%d footer=%d)", keyboard != g_keyboard,
+                 panel != g_panel, footer != g_footer);
+        RemoveRow();
+    }
     if (!g_button) {
         TRACE_BLOCK();
+        // A footer still at a height this mod applied (the row was removed
+        // while expanded) is reset to the stock height seen at first insert.
+        if (g_knownStockFooter > 0) {
+            const auto current = footer.Height();
+            if (current.GridUnitType == GridUnitType::Pixel && current.Value > 16 &&
+                footer.MinHeight() == current.Value && footer.MaxHeight() == current.Value) {
+                RowState(L"reset leftover footer %.1f -> %.1f", current.Value, g_knownStockFooter);
+                footer.MinHeight(g_knownStockFooter);
+                footer.Height({g_knownStockFooter, GridUnitType::Pixel});
+                footer.MaxHeight(g_knownStockFooter);
+            }
+        }
         const auto stockHeight = footer.Height();
         const auto minimum = footer.MinHeight();
         const auto maximum = footer.MaxHeight();
@@ -3359,7 +3482,13 @@ void RefreshRow(HWND hwnd) {
         if (stockHeight.GridUnitType != GridUnitType::Pixel || stockHeight.Value <= 0 || stockHeight.Value > 16 ||
             minimum != stockHeight.Value || maximum != stockHeight.Value ||
             !background || Grid::GetRow(background) + Grid::GetRowSpan(background) != footerIndex + 1 ||
-            !stroke || Grid::GetRow(stroke) + Grid::GetRowSpan(stroke) != footerIndex + 1) return;
+            !stroke || Grid::GetRow(stroke) + Grid::GetRowSpan(stroke) != footerIndex + 1) {
+            RowState(L"footer not stock (height=%.1f unit=%d min=%.1f max=%.1f bg=%d stroke=%d)", stockHeight.Value,
+                     static_cast<int>(stockHeight.GridUnitType), minimum, maximum,
+                     background ? Grid::GetRow(background) + Grid::GetRowSpan(background) : -1,
+                     stroke ? Grid::GetRow(stroke) + Grid::GetRowSpan(stroke) : -1);
+            return;
+        }
         auto button = MakeButton(L"Ctrl");
         AttachModifierSlide(button, VK_CONTROL, g_ctrlSlideHandlers);
         const auto click = button.Click([hwnd](auto&&, auto&&) {
@@ -3464,6 +3593,7 @@ void RefreshRow(HWND hwnd) {
         g_click = click;
         g_footer = footer;
         g_stockFooterHeight = stockHeight;
+        g_knownStockFooter = stockHeight.Value;
         g_stockFooterMin = minimum;
         g_stockFooterMax = maximum;
         g_appliedFooterHeight = stockHeight.Value;
@@ -3471,7 +3601,7 @@ void RefreshRow(HWND hwnd) {
         g_rowNeedsRemoval = true;
         panel.Children().Append(strip);
         g_rowNeedsRemoval = false;
-        Wh_Log(L"Compact key row: added shortcut keys and arrows to native keyboard panel");
+        RowState(L"row added");
     }
 
     UpdateInjectedKeyTheme(panel, keys);
@@ -3518,8 +3648,14 @@ void RefreshRow(HWND hwnd) {
     if (!fits && HoldRowThroughGlitch(hwnd)) return;
     g_rowUnstableSince = 0;
     KillTimer(hwnd, kGraceTimer);
-    if (g_strip.IsHitTestVisible() != fits) g_strip.IsHitTestVisible(fits);
-    if (g_strip.Opacity() != (fits ? 1.0 : 0.0)) g_strip.Opacity(fits ? 1.0 : 0.0);
+    const bool shown = fits && FrameHasRowRoom();
+    if (fits && !shown)
+        RowState(L"waiting for frame (applied view %.1f, rows want %.1f)", FrameSize::g_appliedView.load(),
+                 FrameSize::g_wantedView.load());
+    else if (shown)
+        RowState(L"shown");
+    if (g_strip.IsHitTestVisible() != shown) g_strip.IsHitTestVisible(shown);
+    if (g_strip.Opacity() != (shown ? 1.0 : 0.0)) g_strip.Opacity(shown ? 1.0 : 0.0);
     if (!fits) return;
 
     double scale = 1;
@@ -3586,7 +3722,7 @@ LRESULT CALLBACK UiWindowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     }
     if (message == kRefresh || (message == WM_TIMER && (wp == kWatchdog || wp == kGraceTimer))) {
         TRACE_BLOCK();
-        if (message == WM_TIMER && wp == kGraceTimer) KillTimer(hwnd, kGraceTimer);
+        if (message == WM_TIMER && wp != kWatchdog) KillTimer(hwnd, wp);
         if (message == kRefresh) g_refreshQueued = false;
         if (g_stopping || g_refreshing) return 0;
         g_refreshing = true;
@@ -3744,6 +3880,7 @@ bool HookTextInput(HMODULE mod) {
         FooterKeys::Install(mod);  // also feeds the symbol pass used below
         AutoHide::Finish(mod);
         Wh_Log(L"Key sound: native click %s", KeySound::Install() ? L"available" : L"unavailable");
+        Wh_Log(L"Frame size: apply hook %s", FrameSize::Install() ? L"installed" : L"unavailable");
         void* tryHide = AutoHide::TryHideBody(mod);
         const bool hooked = tryHide &&
             Wh_SetFunctionHook(tryHide, reinterpret_cast<void*>(KeyboardTryHide_hook),
