@@ -557,11 +557,13 @@ static DWORD BubbleMonitorRefreshRate(HWND hwnd) {
     return g_monitorHz;
 }
 constexpr LONG kMaxBubbleDiameter = 512;
+constexpr float kBubbleHeadroom = 1.12f;  // window size / resting bubble size
 
 // --- bubble (explorer) ---
-// Chat-head style: appears where X was tapped, glides to the nearest left or
-// right edge on an under-damped spring, follows the finger while dragged,
-// flings on release, and fades after being idle.
+// Messenger chat-head style: pops in where X was tapped, glides to a left or
+// right edge on an under-damped spring, shrinks while pressed and springs
+// back, follows the finger while dragged, flings on release with momentum,
+// and fades after being idle.
 struct Bubble {
     int d = 0;                 // diameter (px)
     float x = 0, y = 0;        // top-left (px)
@@ -575,8 +577,18 @@ struct Bubble {
     POINT downPt{};
     float grabX = 0, grabY = 0;
     POINT lastPt{};
-    LARGE_INTEGER lastMove{};
-    float dragVx = 0, dragVy = 0;
+    // Recent input samples for a least-squares velocity fit (Android's
+    // VelocityTracker approach), so a flick reads its real speed.
+    struct Sample { double t; float x, y; };
+    std::array<Sample, 20> samples{};
+    size_t sampleCount = 0, sampleNext = 0;
+    // scale spring (press feedback and pop-in)
+    float scale = 1, scaleV = 0, scaleTarget = 1;
+    float scaleK = 500, scaleZeta = 0.5f;
+    // shrink-away exit after a tap opens the keyboard
+    bool leaving = false;
+    double leaveStart = 0;
+    float leaveFromScale = 1;  // the exit continues from the current (e.g. pressed) scale
     // opacity
     int alpha = 255, alphaTarget = 255;
     ULONGLONG idleDeadline = 0;
@@ -597,15 +609,13 @@ static int BubbleDiameterAt(POINT pt) {
     TRACE_SCOPE();
     // TEMPLATE_PART_GripperCloseButton has Width=33 in the compact XAML dump.
     constexpr double closeButtonWidthDip = 33;
-    const double diameterDip = 1.5 * closeButtonWidthDip;
+    // The window includes headroom for the scale spring's overshoot.
+    const double diameterDip = 1.5 * closeButtonWidthDip * kBubbleHeadroom;
     UINT dpiX = 96, dpiY = 96;
     GetDpiForMonitor(MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST), MDT_EFFECTIVE_DPI, &dpiX, &dpiY);
     return std::clamp(static_cast<int>(std::lround(diameterDip * dpiX / 96.0)), 1,
                       static_cast<int>(kMaxBubbleDiameter));
 }
-
-// Premultiplied ARGB circle with a keyboard glyph, anti-aliased by coverage.
-static DWORD g_renderedBubbleAccent;
 
 // The touch keyboard's highlighted-key color (its accent Enter) as 0x00RRGGBB,
 // available before the keyboard ever opens: the system accent palette shade
@@ -632,16 +642,14 @@ static DWORD BubbleAccentColor() {
     return 0x0078D4;  // default Windows blue
 }
 
-static bool RenderBubbleBitmap(int d) {
-    TRACE_SCOPE();
-    const DWORD accent = BubbleAccentColor();
-    if (g_b.memDC && g_b.d == d && g_renderedBubbleAccent == accent) return true;
-    // BGR channel order to match the DIB.
-    const std::array<float, 3> faceColor{static_cast<float>(accent & 0xFF),
-        static_cast<float>((accent >> 8) & 0xFF), static_cast<float>((accent >> 16) & 0xFF)};
-    // Black or white icon, whichever contrasts with the accent (Rec. 601 luma).
-    const float luma = 0.299f * faceColor[2] + 0.587f * faceColor[1] + 0.114f * faceColor[0];
-    const float glyphValue = luma >= 150 ? 0.0f : 255.0f;
+// The surface is allocated once per diameter; painting reuses it, so the
+// press and pop-in scale animations can repaint every frame cheaply.
+static DWORD g_bubbleAccent;
+static void* g_bubbleBits;
+static float g_paintedScale = -1;
+
+static bool EnsureBubbleSurface(int d) {
+    if (g_b.memDC && g_b.d == d && g_bubbleBits) return true;
     BITMAPINFO bi = {};
     bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
     bi.bmiHeader.biWidth = d;
@@ -655,56 +663,11 @@ static bool RenderBubbleBitmap(int d) {
     const HBITMAP bitmap = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
     const auto old = bitmap && bits ? SelectObject(dc, bitmap) : nullptr;
     if (!old || old == HGDI_ERROR) {
-        TRACE_BLOCK();
         DeleteDC(dc);
         if (bitmap) DeleteObject(bitmap);
         return false;
     }
-
-    float c = d / 2.0f, r = d / 2.0f - 0.5f;
-    // Keyboard glyph: rounded outline, two rows of keys and a space bar.
-    // Shapes are rounded boxes evaluated as signed distances for smooth edges.
-    auto roundBox = [](float px, float py, float cx, float cy, float hw, float hh, float rad) {
-        TRACE_BLOCK();
-        float qx = fabsf(px - cx) - (hw - rad), qy = fabsf(py - cy) - (hh - rad);
-        float ox = std::max(qx, 0.0f), oy = std::max(qy, 0.0f);
-        return sqrtf(ox * ox + oy * oy) + std::min(std::max(qx, qy), 0.0f) - rad;
-    };
-    float bw = d * 0.31f, bh = d * 0.20f;        // body half extents
-    float stroke = std::max(1.2f, d * 0.035f);   // outline thickness
-    float kh = d * 0.028f;                       // key half size
-    float colStep = (2 * bw - 2 * stroke) / 6.0f, rowStep = bh * 0.62f;
-    auto glyph = [&](float px, float py) {
-        TRACE_BLOCK();
-        // outline ring of the body
-        float body = roundBox(px, py, c, c, bw, bh, d * 0.05f);
-        float cov = std::clamp(0.5f - (fabsf(body + stroke / 2) - stroke / 2), 0.0f, 1.0f);
-        // two rows of 5 keys
-        for (int rr = 0; rr < 2; rr++)
-            for (int k = 0; k < 5; k++) {
-                TRACE_BLOCK();
-                float kx = c - 2 * colStep + k * colStep, ky = c - rowStep + rr * rowStep * 0.95f;
-                cov = std::max(cov, std::clamp(0.5f - roundBox(px, py, kx, ky, kh, kh, kh * 0.4f), 0.0f, 1.0f));
-            }
-        // space bar
-        float sy = c + rowStep * 0.95f;
-        cov = std::max(cov, std::clamp(0.5f - roundBox(px, py, c, sy, colStep * 1.6f, kh, kh * 0.6f), 0.0f, 1.0f));
-        return cov;
-    };
-    BYTE* p = (BYTE*)bits;
-    for (int yy = 0; yy < d; yy++)
-        for (int xx = 0; xx < d; xx++, p += 4) {
-            TRACE_BLOCK();
-            float px = xx + 0.5f, py = yy + 0.5f;
-            float dist = sqrtf((px - c) * (px - c) + (py - c) * (py - c));
-            const float cov = std::clamp(0.5f - (dist - r), 0.0f, 1.0f);
-            const float g = glyph(px, py);
-            for (int channel = 0; channel < 3; ++channel)  // premultiplied
-                p[channel] = static_cast<BYTE>((faceColor[channel] * (1 - g) + glyphValue * g) * cov + 0.5f);
-            p[3] = static_cast<BYTE>(cov * 255 + 0.5f);
-        }
     if (g_b.memDC) {
-        TRACE_BLOCK();
         SelectObject(g_b.memDC, g_b.oldBmp);
         DeleteDC(g_b.memDC);
         DeleteObject(g_b.bmp);
@@ -713,7 +676,81 @@ static bool RenderBubbleBitmap(int d) {
     g_b.bmp = bitmap;
     g_b.oldBmp = static_cast<HBITMAP>(old);
     g_b.d = d;
-    g_renderedBubbleAccent = accent;
+    g_bubbleBits = bits;
+    g_paintedScale = -1;
+    return true;
+}
+
+// Premultiplied ARGB circle with a keyboard glyph, drawn at `scale` about the
+// centre. Signed distances are evaluated in unscaled space and multiplied by
+// the scale, so edges stay one pixel soft at every size.
+static void PaintBubble(float animatedScale) {
+    if (!g_bubbleBits || std::fabs(animatedScale - g_paintedScale) < 0.002f) return;
+    g_paintedScale = animatedScale;
+    // The window has kBubbleHeadroom extra room so spring overshoot is not
+    // clipped; at rest the bubble fills 1 / kBubbleHeadroom of it.
+    const float scale = std::min(animatedScale, kBubbleHeadroom) / kBubbleHeadroom;
+    const int d = g_b.d;
+    BYTE* p = static_cast<BYTE*>(g_bubbleBits);
+    if (scale < 0.02f) {
+        memset(p, 0, static_cast<size_t>(d) * d * 4);
+        return;
+    }
+    const DWORD accent = g_bubbleAccent;
+    // BGR channel order to match the DIB.
+    const std::array<float, 3> faceColor{static_cast<float>(accent & 0xFF),
+        static_cast<float>((accent >> 8) & 0xFF), static_cast<float>((accent >> 16) & 0xFF)};
+    // Black or white icon, whichever contrasts with the accent (Rec. 601 luma).
+    const float luma = 0.299f * faceColor[2] + 0.587f * faceColor[1] + 0.114f * faceColor[0];
+    const float glyphValue = luma >= 150 ? 0.0f : 255.0f;
+
+    const float c = d / 2.0f, r = d / 2.0f - 0.5f;
+    // Keyboard glyph: rounded outline, two rows of keys and a space bar.
+    auto roundBox = [](float px, float py, float cx, float cy, float hw, float hh, float rad) {
+        float qx = fabsf(px - cx) - (hw - rad), qy = fabsf(py - cy) - (hh - rad);
+        float ox = std::max(qx, 0.0f), oy = std::max(qy, 0.0f);
+        return sqrtf(ox * ox + oy * oy) + std::min(std::max(qx, qy), 0.0f) - rad;
+    };
+    const float bw = d * 0.31f, bh = d * 0.20f;        // body half extents
+    const float stroke = std::max(1.2f, d * 0.035f);   // outline thickness
+    const float kh = d * 0.028f;                       // key half size
+    const float colStep = (2 * bw - 2 * stroke) / 6.0f, rowStep = bh * 0.62f;
+    const auto soft = [scale](float distance) { return std::clamp(0.5f - distance * scale, 0.0f, 1.0f); };
+    auto glyph = [&](float px, float py) {
+        const float body = roundBox(px, py, c, c, bw, bh, d * 0.05f);
+        float cov = soft(fabsf(body + stroke / 2) - stroke / 2);
+        for (int rr = 0; rr < 2; rr++)
+            for (int k = 0; k < 5; k++) {
+                const float kx = c - 2 * colStep + k * colStep, ky = c - rowStep + rr * rowStep * 0.95f;
+                cov = std::max(cov, soft(roundBox(px, py, kx, ky, kh, kh, kh * 0.4f)));
+            }
+        const float sy = c + rowStep * 0.95f;
+        return std::max(cov, soft(roundBox(px, py, c, sy, colStep * 1.6f, kh, kh * 0.6f)));
+    };
+    for (int yy = 0; yy < d; yy++)
+        for (int xx = 0; xx < d; xx++, p += 4) {
+            // Map the screen pixel back into unscaled bubble space.
+            const float px = c + (xx + 0.5f - c) / scale, py = c + (yy + 0.5f - c) / scale;
+            const float dist = sqrtf((px - c) * (px - c) + (py - c) * (py - c));
+            const float cov = soft(dist - r);
+            if (cov <= 0) {
+                p[0] = p[1] = p[2] = p[3] = 0;
+                continue;
+            }
+            const float g = glyph(px, py);
+            for (int channel = 0; channel < 3; ++channel)  // premultiplied
+                p[channel] = static_cast<BYTE>((faceColor[channel] * (1 - g) + glyphValue * g) * cov + 0.5f);
+            p[3] = static_cast<BYTE>(cov * 255 + 0.5f);
+        }
+}
+
+// Refreshes the accent (once per show) and paints at the current scale.
+static bool RenderBubbleBitmap(int d) {
+    TRACE_SCOPE();
+    g_bubbleAccent = BubbleAccentColor();
+    if (!EnsureBubbleSurface(d)) return false;
+    g_paintedScale = -1;
+    PaintBubble(g_b.scale);
     return true;
 }
 
@@ -756,9 +793,17 @@ static void BubbleDock(HWND h, float vx, float vy) {
         BubbleArmIdle(h);
         return;
     }
-    float margin = std::max(4.0f, g_b.d * 0.12f);
-    float projX = cx + vx * 0.18f, projY = g_b.y + vy * 0.12f;
-    bool left = projX < (wa.left + wa.right) / 2.0f;
+    // Margins are for the visible circle; the window adds transparent headroom.
+    const float visible = g_b.d / kBubbleHeadroom, pad = (g_b.d - visible) / 2;
+    float margin = std::max(4.0f, visible * 0.12f) - pad;
+    // A deliberate horizontal flick commits to that side, as chat heads do;
+    // a gentle release goes to the nearer edge after a short projection.
+    // Vertical momentum carries on with friction (about a quarter second of
+    // travel) before the spring settles it inside the work area.
+    const float flingThreshold = visible * 6;  // px/s
+    const bool flung = fabsf(vx) > flingThreshold;
+    bool left = flung ? vx < 0 : cx + vx * 0.1f < (wa.left + wa.right) / 2.0f;
+    float projY = g_b.y + vy * 0.25f;
     const float right = std::max((float)wa.left, (float)wa.right - g_b.d);
     const float horizontalMargin = std::min(margin, (right - wa.left) / 2);
     g_b.tx = left ? wa.left + horizontalMargin : right - horizontalMargin;
@@ -772,10 +817,72 @@ static void BubbleDock(HWND h, float vx, float vy) {
     BubbleDisarmIdle(h);
 }
 
-// The worker schedules frames while the bubble is moving or fading.
+// Scale springs, tuned after Messenger's chat heads: a quick, nearly
+// critically damped press, a bouncy release, and a softer bouncy pop-in.
+constexpr float kPressedScale = 0.88f;
+static void BubbleScaleTo(float target, float stiffness, float dampingRatio) {
+    g_b.scaleTarget = target;
+    g_b.scaleK = stiffness;
+    g_b.scaleZeta = dampingRatio;
+}
+static void BubblePressScale() { BubbleScaleTo(kPressedScale, 1400, 0.85f); }
+static void BubbleReleaseScale() { BubbleScaleTo(1, 700, 0.38f); }
+static void BubblePopIn() {
+    g_b.scale = 0;
+    g_b.scaleV = 0;
+    BubbleScaleTo(1, 380, 0.42f);
+}
+
+static bool BubbleScaleAnimating() {
+    return fabsf(g_b.scale - g_b.scaleTarget) > 0.001f || fabsf(g_b.scaleV) > 0.01f;
+}
+
+// The worker schedules frames while the bubble is moving, scaling or fading.
 static bool BubbleNeedsFrames() {
     TRACE_SCOPE();
-    return g_b.animating || g_b.dragged || g_b.alpha != g_b.alphaTarget;
+    return g_b.animating || g_b.dragged || g_b.alpha != g_b.alphaTarget || BubbleScaleAnimating() ||
+           g_b.leaving;
+}
+
+// After a tap opens the keyboard the bubble shrinks away in place, then hides.
+// Timing and curve match Android's FastOutSlowInInterpolator over 250 ms.
+constexpr double kBubbleLeaveSeconds = 0.25;
+// A tap-opened keyboard can report visible only after the exit ends; keep the
+// bubble down until then instead of popping it back in. If the keyboard never
+// shows, the bubble returns after this long.
+constexpr ULONGLONG kBubbleRelaunchGraceMs = 1500;
+static ULONGLONG g_bubbleHeldDownUntil;
+
+// cubic-bezier(0.4, 0, 0.2, 1): solve x(s) = t by Newton's method, return y(s).
+static float FastOutSlowIn(float t) {
+    constexpr float x1 = 0.4f, y1 = 0.0f, x2 = 0.2f, y2 = 1.0f;
+    const auto bezier = [](float s, float p1, float p2) {
+        const float u = 1 - s;
+        return 3 * u * u * s * p1 + 3 * u * s * s * p2 + s * s * s;
+    };
+    const auto slope = [](float s, float p1, float p2) {
+        const float u = 1 - s;
+        return 3 * u * u * p1 + 6 * u * s * (p2 - p1) + 3 * s * s * (1 - p2);
+    };
+    float s = t;
+    for (int i = 0; i < 8; ++i) {
+        const float dx = slope(s, x1, x2);
+        if (fabsf(dx) < 1e-5f) break;
+        s = std::clamp(s - (bezier(s, x1, x2) - t) / dx, 0.0f, 1.0f);
+    }
+    return bezier(s, y1, y2);
+}
+
+static double NowSeconds();
+static void BubbleHide(HWND h);
+static void BubbleLeave(HWND h) {
+    g_b.leaving = true;
+    g_b.animating = false;
+    g_b.leaveStart = NowSeconds();
+    g_b.leaveFromScale = std::max(g_b.scale, 0.0f);
+    g_b.alpha = g_b.alphaTarget = 255;  // fully visible, as on the way in
+    g_b.idleDeadline = 0;
+    KillTimer(h, kIdleTimer);
 }
 
 static void BubbleTouch(HWND h) {
@@ -808,6 +915,17 @@ static void BubbleAnimStep(HWND h) {
     float dt = (float)std::min(Seconds(g_b.lastTick, now), 0.05);
     g_b.lastTick = now;
 
+    if (g_b.leaving) {
+        // Shrink away in place on FastOutSlowIn, staying fully opaque.
+        const float t = static_cast<float>(std::clamp((NowSeconds() - g_b.leaveStart) / kBubbleLeaveSeconds, 0.0, 1.0));
+        g_b.scale = g_b.scaleTarget = g_b.leaveFromScale * (1 - FastOutSlowIn(t));
+        g_b.scaleV = 0;
+        PaintBubble(g_b.scale);
+        if (t >= 1) {
+            BubbleHide(h);
+            return;
+        }
+    }
     if (g_b.dragged) {  // follow the finger, coalesced to one move per frame
         g_b.x = g_b.lastPt.x - g_b.grabX;
         g_b.y = g_b.lastPt.y - g_b.grabY;
@@ -832,6 +950,20 @@ static void BubbleAnimStep(HWND h) {
             BubbleArmIdle(h);
         }
     }
+    if (BubbleScaleAnimating()) {
+        const float damping = 2.0f * sqrtf(g_b.scaleK) * g_b.scaleZeta;
+        for (int i = 0; i < 4; i++) {
+            const float h4 = dt / 4;
+            g_b.scaleV += (g_b.scaleK * (g_b.scaleTarget - g_b.scale) - damping * g_b.scaleV) * h4;
+            g_b.scale += g_b.scaleV * h4;
+        }
+        g_b.scale = std::max(g_b.scale, 0.0f);
+        if (fabsf(g_b.scale - g_b.scaleTarget) < 0.002f && fabsf(g_b.scaleV) < 0.05f) {
+            g_b.scale = g_b.scaleTarget;
+            g_b.scaleV = 0;
+        }
+        PaintBubble(g_b.scale);
+    }
     if (g_b.alpha != g_b.alphaTarget) {
         TRACE_BLOCK();
         int step = std::max(1, (int)(dt * 900));  // ~250 ms full fade
@@ -850,9 +982,46 @@ static void BubbleAnimStep(HWND h) {
 // Touch drags never arrive as mouse moves (Windows treats them as a pan), so
 // pointer messages are used; the keyboard opens only on a tap, i.e. a release
 // that never moved past the slop.
+static double NowSeconds() {
+    LARGE_INTEGER now, frequency;
+    QueryPerformanceCounter(&now);
+    QueryPerformanceFrequency(&frequency);
+    return double(now.QuadPart) / double(frequency.QuadPart);
+}
+
+static void BubbleAddSample(POINT p) {
+    g_b.samples[g_b.sampleNext] = {NowSeconds(), static_cast<float>(p.x), static_cast<float>(p.y)};
+    g_b.sampleNext = (g_b.sampleNext + 1) % g_b.samples.size();
+    g_b.sampleCount = std::min(g_b.sampleCount + 1, g_b.samples.size());
+}
+
+// Least-squares slope of position over the last 100 ms of samples. A finger
+// that stopped moving more than 80 ms before release has no velocity.
+static void BubbleReleaseVelocity(float& vx, float& vy) {
+    vx = vy = 0;
+    if (g_b.sampleCount < 2) return;
+    const size_t size = g_b.samples.size();
+    const auto& latest = g_b.samples[(g_b.sampleNext + size - 1) % size];
+    if (NowSeconds() - latest.t > 0.08) return;
+    double n = 0, st = 0, sx = 0, sy = 0, stt = 0, stx = 0, sty = 0;
+    for (size_t i = 0; i < g_b.sampleCount; ++i) {
+        const auto& s = g_b.samples[(g_b.sampleNext + size - 1 - i) % size];
+        const double t = s.t - latest.t;  // <= 0
+        if (t < -0.1) break;
+        n += 1; st += t; sx += s.x; sy += s.y; stt += t * t; stx += t * s.x; sty += t * s.y;
+    }
+    const double denominator = n * stt - st * st;
+    if (n < 2 || denominator <= 1e-9) return;
+    vx = static_cast<float>((n * stx - st * sx) / denominator);
+    vy = static_cast<float>((n * sty - st * sy) / denominator);
+}
+
 static void BubbleInputDown(HWND h, POINT p) {
     TRACE_SCOPE();
     BubbleTouch(h);
+    BubblePressScale();
+    g_b.sampleCount = g_b.sampleNext = 0;
+    BubbleAddSample(p);
     g_b.down = true;
     g_b.dragged = false;
     g_b.animating = false;
@@ -860,27 +1029,16 @@ static void BubbleInputDown(HWND h, POINT p) {
     g_b.grabX = p.x - g_b.x;
     g_b.grabY = p.y - g_b.y;
     g_b.lastPt = p;
-    QueryPerformanceCounter(&g_b.lastMove);
-    g_b.lastTick = g_b.lastMove;
-    g_b.dragVx = g_b.dragVy = 0;
+    QueryPerformanceCounter(&g_b.lastTick);
 }
 
 static void BubbleInputMove(POINT p) {
     TRACE_SCOPE();
     if (!g_b.down) return;
+    BubbleAddSample(p);
     int slop = std::max(6, g_b.d / 8);
     if (!g_b.dragged && abs(p.x - g_b.downPt.x) <= slop && abs(p.y - g_b.downPt.y) <= slop) return;
     g_b.dragged = true;
-    LARGE_INTEGER now;
-    QueryPerformanceCounter(&now);
-    float dt = (float)Seconds(g_b.lastMove, now);
-    if (dt > 0.002f) {
-        TRACE_BLOCK();
-        float vx = (p.x - g_b.lastPt.x) / dt, vy = (p.y - g_b.lastPt.y) / dt;
-        g_b.dragVx = 0.6f * vx + 0.4f * g_b.dragVx;
-        g_b.dragVy = 0.6f * vy + 0.4f * g_b.dragVy;
-        g_b.lastMove = now;
-    }
     g_b.lastPt = p;
 }
 
@@ -892,19 +1050,23 @@ static void BubbleInputUp(HWND h, POINT p) {
     g_b.down = false;
     g_b.dragged = false;
     g_b.pointerId = 0;
+    BubbleReleaseScale();
     if (!wasDrag) {  // tap
-        if (!ToggleKeyboard()) Wh_Log(L"Could not open the touch keyboard from the bubble");
-        // The show hook hides the bubble once Windows handles the request.
-        BubbleArmIdle(h);
+        if (ToggleKeyboard()) {
+            g_bubbleHeldDownUntil = GetTickCount64() + kBubbleRelaunchGraceMs;
+            BubbleLeave(h);  // the bubble hides itself when the exit finishes
+        } else {
+            Wh_Log(L"Could not open the touch keyboard from the bubble");
+            BubbleArmIdle(h);
+        }
         return;
     }
     g_b.x = p.x - g_b.grabX;
     g_b.y = p.y - g_b.grabY;
-    LARGE_INTEGER now;
-    QueryPerformanceCounter(&now);
-    if (Seconds(g_b.lastMove, now) > 0.08) g_b.dragVx = g_b.dragVy = 0;  // held still before release
-    const float maxV = 6000;
-    BubbleDock(h, std::clamp(g_b.dragVx, -maxV, maxV), std::clamp(g_b.dragVy, -maxV, maxV));
+    float vx, vy;
+    BubbleReleaseVelocity(vx, vy);
+    const float maxV = 8000;
+    BubbleDock(h, std::clamp(vx, -maxV, maxV), std::clamp(vy, -maxV, maxV));
 }
 
 static void BubbleInputCancel(HWND h) {
@@ -913,6 +1075,7 @@ static void BubbleInputCancel(HWND h) {
     g_b.down = false;
     g_b.dragged = false;
     g_b.pointerId = 0;
+    BubbleReleaseScale();
     BubbleDock(h, 0, 0);
 }
 
@@ -987,6 +1150,8 @@ static void BubbleShow(HWND h, const POINT* closePoint, bool positioned) {
     const auto limit = std::min({kMaxBubbleDiameter, wa.right - wa.left, wa.bottom - wa.top});
     if (limit <= 0) return;
     const int d = std::min(BubbleDiameterAt(pt), static_cast<int>(limit));
+    g_b.leaving = false;  // a new appearance supersedes an exit in flight
+    BubblePopIn();  // grow from nothing on a bouncy spring, like a new chat head
     if (!RenderBubbleBitmap(d)) {
         TRACE_BLOCK();
         Wh_Log(L"Could not allocate bubble bitmap (%d px)", d);
@@ -1004,6 +1169,7 @@ static void BubbleShow(HWND h, const POINT* closePoint, bool positioned) {
 
 static void BubbleHide(HWND h) {
     if (GetCapture() == h) ReleaseCapture();
+    g_b.leaving = false;
     g_b.down = g_b.dragged = false;
     g_b.pointerId = 0;
     BubbleDisarmIdle(h);
@@ -1047,7 +1213,7 @@ LRESULT CALLBACK WorkerProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 break;
             }
             if (type != PT_TOUCH && type != PT_PEN) break;
-            if (msg == WM_POINTERDOWN && g_b.down) return 0;
+            if (msg == WM_POINTERDOWN && (g_b.down || g_b.leaving)) return 0;
             if (msg != WM_POINTERDOWN && (!g_b.down || g_b.pointerId != id)) return 0;
             POINTER_INFO info;
             if (GetPointerInfo(id, &info) && (info.pointerFlags & POINTER_FLAG_CANCELED)) {
@@ -1075,7 +1241,7 @@ LRESULT CALLBACK WorkerProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         // mouse
         case WM_LBUTTONDOWN: {
             TRACE_BLOCK();
-            if (g_b.down) return 0;
+            if (g_b.down || g_b.leaving) return 0;
             POINT p;
             if (!GetCursorPos(&p)) return 0;
             BubbleInputDown(h, p);
@@ -1150,6 +1316,9 @@ DWORD WINAPI WorkerThread(LPVOID) {
         TRACE_BLOCK();
         // No press-and-hold / flicks / pen feedback on the bubble.
         SetProp(hwnd, L"MicrosoftTabletPenServiceProperty", (HANDLE)(ULONG_PTR)(0x00000001 | 0x00000008 | 0x00000010 | 0x00010000));
+        // The bubble animates itself; no system show/hide transitions on top.
+        BOOL noTransitions = TRUE;
+        DwmSetWindowAttribute(hwnd, DWMWA_TRANSITIONS_FORCEDISABLED, &noTransitions, sizeof(noTransitions));
         BOOL off = FALSE;
         for (auto fb : {FEEDBACK_TOUCH_CONTACTVISUALIZATION, FEEDBACK_TOUCH_TAP, FEEDBACK_TOUCH_PRESSANDHOLD,
                         FEEDBACK_GESTURE_PRESSANDTAP})
@@ -1187,11 +1356,15 @@ DWORD WINAPI WorkerThread(LPVOID) {
             }
             const bool show = bubbleEnabled &&
                               (tick < closeOverrideUntil || !TouchKeyboardVisible());
-            if (show && !IsWindowVisible(hwnd)) {
+            if (!show) g_bubbleHeldDownUntil = 0;  // the keyboard is up; the hold did its job
+            if (show && !IsWindowVisible(hwnd) && tick >= g_bubbleHeldDownUntil) {
                 BubbleShow(hwnd, nullptr, positioned);
                 positioned = IsWindowVisible(hwnd) || positioned;
-            } else if (!show && IsWindowVisible(hwnd)) {
-                BubbleHide(hwnd);
+            } else if (!show && IsWindowVisible(hwnd) && !g_b.leaving) {
+                // The keyboard opened some other way: same shrink-away exit,
+                // unless the bubble is being held.
+                if (g_b.down) BubbleHide(hwnd);
+                else BubbleLeave(hwnd);
             }
         }
         const bool frames = BubbleNeedsFrames();
@@ -1225,6 +1398,7 @@ DWORD WINAPI WorkerThread(LPVOID) {
             TRACE_BLOCK();
             const LONG hint = g_shared ? InterlockedExchange(&g_shared->bubbleVisibilityHint, 0) : 0;
             if (hint == kBubbleCloseHint && ReadSettings().bubbleOnClose) {
+                g_bubbleHeldDownUntil = 0;  // closing with X always brings the bubble back
                 // The keyboard can still report visible while its close animation runs.
                 closeOverrideUntil = GetTickCount64() + kPanelVisibilityLeaseMs;
                 const auto packed = static_cast<UINT64>(InterlockedCompareExchange64(&g_shared->bubbleClosePoint, 0, 0));
@@ -1268,6 +1442,8 @@ DWORD WINAPI WorkerThread(LPVOID) {
         DeleteDC(g_b.memDC);
         DeleteObject(g_b.bmp);
         g_b.memDC = nullptr;
+        g_bubbleBits = nullptr;
+        g_paintedScale = -1;
     }
     if (registered) UnregisterClass(wc.lpszClassName, wc.hInstance);
     if (SUCCEEDED(com)) CoUninitialize();
