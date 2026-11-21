@@ -332,13 +332,12 @@ struct SharedState {
     LONG format;
     LONG bubbleVisibilityHint;
     alignas(8) LONG64 bubbleClosePoint;
-    alignas(8) LONG64 bubbleKeyStyle;
     alignas(8) LONG64 compactModeDeadline;
 };
 SharedState* g_shared;
 HANDLE g_sharedMap;
 HANDLE g_bubbleEvt;  // auto-reset; requests an immediate visibility check
-constexpr LONG kSharedFormat = 0x544B0007;
+constexpr LONG kSharedFormat = 0x544B0008;
 constexpr LONG kBubbleCloseHint = 1;
 constexpr LONG kBubbleShowHint = 2;
 constexpr LONG64 kNoBubbleClosePoint = INT64_MIN;
@@ -379,8 +378,8 @@ void InitShared() {
         SetSecurityDescriptorDacl(&sd, TRUE, acl, FALSE)) {
         TRACE_BLOCK();
         SECURITY_ATTRIBUTES sa = {sizeof(sa), &sd, FALSE};
-        constexpr auto mapName = L"Local\\WhTouchKeyboardEnhancement.State.v7";
-        constexpr auto eventName = L"Local\\WhTouchKeyboardEnhancement.Bubble.v7";
+        constexpr auto mapName = L"Local\\WhTouchKeyboardEnhancement.State.v8";
+        constexpr auto eventName = L"Local\\WhTouchKeyboardEnhancement.Bubble.v8";
         constexpr DWORD mapRights = FILE_MAP_READ | FILE_MAP_WRITE;
         g_sharedMap = OpenFileMapping(mapRights | READ_CONTROL, FALSE, mapName);
         if (!g_sharedMap && GetLastError() == ERROR_FILE_NOT_FOUND) {
@@ -606,22 +605,43 @@ static int BubbleDiameterAt(POINT pt) {
 }
 
 // Premultiplied ARGB circle with a keyboard glyph, anti-aliased by coverage.
-static UINT64 g_renderedBubbleStyle;
+static DWORD g_renderedBubbleAccent;
+
+// The touch keyboard's highlighted-key color (its accent Enter) as 0x00RRGGBB,
+// available before the keyboard ever opens: the system accent palette shade
+// the keyboard uses, AccentLight2 in dark app mode and AccentDark1 in light.
+static DWORD BubbleAccentColor() {
+    DWORD lightApps = 0, lightSize = sizeof(lightApps);
+    RegGetValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+                 L"AppsUseLightTheme", RRF_RT_REG_DWORD, nullptr, &lightApps, &lightSize);
+    try {
+        using winrt::Windows::UI::ViewManagement::UIColorType;
+        const auto color = winrt::Windows::UI::ViewManagement::UISettings().GetColorValue(
+            lightApps ? UIColorType::AccentDark1 : UIColorType::AccentLight2);
+        return (DWORD{color.R} << 16) | (DWORD{color.G} << 8) | color.B;
+    } catch (const winrt::hresult_error&) {
+        // Fall back to the base accent below.
+    }
+    DWORD abgr = 0, size = sizeof(abgr);
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\DWM", L"AccentColor",
+                     RRF_RT_REG_DWORD, nullptr, &abgr, &size) == ERROR_SUCCESS)
+        return ((abgr & 0xFF) << 16) | (abgr & 0xFF00) | ((abgr >> 16) & 0xFF);
+    DWORD argb = 0;
+    BOOL opaque = FALSE;
+    if (SUCCEEDED(DwmGetColorizationColor(&argb, &opaque))) return argb & 0xFFFFFF;
+    return 0x0078D4;  // default Windows blue
+}
 
 static bool RenderBubbleBitmap(int d) {
     TRACE_SCOPE();
-    const UINT64 style = g_shared ?
-        static_cast<UINT64>(InterlockedCompareExchange64(&g_shared->bubbleKeyStyle, 0, 0)) : 0;
-    if (g_b.memDC && g_b.d == d && g_renderedBubbleStyle == style) return true;
-    const auto rgb = [](UINT64 packed) {
-        return std::array<float, 3>{static_cast<float>(packed & 31) * 255 / 31,
-            static_cast<float>((packed >> 5) & 63) * 255 / 63,
-            static_cast<float>((packed >> 11) & 31) * 255 / 31};
-    };
-    const auto faceColor = rgb(style);
-    const auto borderColor = rgb(style >> 16);
-    const auto glyphColor = rgb(style >> 32);
-    const float themedBorder = d * ((style >> 56) & 0x7F) / 254.0f;
+    const DWORD accent = BubbleAccentColor();
+    if (g_b.memDC && g_b.d == d && g_renderedBubbleAccent == accent) return true;
+    // BGR channel order to match the DIB.
+    const std::array<float, 3> faceColor{static_cast<float>(accent & 0xFF),
+        static_cast<float>((accent >> 8) & 0xFF), static_cast<float>((accent >> 16) & 0xFF)};
+    // Black or white icon, whichever contrasts with the accent (Rec. 601 luma).
+    const float luma = 0.299f * faceColor[2] + 0.587f * faceColor[1] + 0.114f * faceColor[0];
+    const float glyphValue = luma >= 150 ? 0.0f : 255.0f;
     BITMAPINFO bi = {};
     bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
     bi.bmiHeader.biWidth = d;
@@ -677,24 +697,11 @@ static bool RenderBubbleBitmap(int d) {
             TRACE_BLOCK();
             float px = xx + 0.5f, py = yy + 0.5f;
             float dist = sqrtf((px - c) * (px - c) + (py - c) * (py - c));
-            // Always a circle; the key style supplies colors and border only.
-            const float edge = dist - r;
-            float cov = std::clamp(0.5f - edge, 0.0f, 1.0f);
-            float ring = std::clamp(1.5f - fabsf(r - 1.0f - dist), 0.0f, 1.0f);  // subtle rim
-            float g = glyph(px, py);
-            float col = (40 + 30 * ring) * (1 - g) + 235 * g;
-            BYTE a = (BYTE)(cov * 255 + 0.5f);
-            BYTE v = (BYTE)(col * cov + 0.5f);  // premultiplied
-            if (style) {
-                const float border = themedBorder > 0 ? std::clamp(edge + themedBorder + 0.5f, 0.0f, 1.0f) : 0;
-                for (int channel = 0; channel < 3; ++channel) {
-                    const float background = faceColor[channel] * (1 - border) + borderColor[channel] * border;
-                    p[channel] = static_cast<BYTE>((background * (1 - g) + glyphColor[channel] * g) * cov + 0.5f);
-                }
-            } else {
-                p[0] = p[1] = p[2] = v;
-            }
-            p[3] = a;
+            const float cov = std::clamp(0.5f - (dist - r), 0.0f, 1.0f);
+            const float g = glyph(px, py);
+            for (int channel = 0; channel < 3; ++channel)  // premultiplied
+                p[channel] = static_cast<BYTE>((faceColor[channel] * (1 - g) + glyphValue * g) * cov + 0.5f);
+            p[3] = static_cast<BYTE>(cov * 255 + 0.5f);
         }
     if (g_b.memDC) {
         TRACE_BLOCK();
@@ -706,7 +713,7 @@ static bool RenderBubbleBitmap(int d) {
     g_b.bmp = bitmap;
     g_b.oldBmp = static_cast<HBITMAP>(old);
     g_b.d = d;
-    g_renderedBubbleStyle = style;
+    g_renderedBubbleAccent = accent;
     return true;
 }
 
@@ -2383,36 +2390,6 @@ static bool ReadBubbleBrush(const Media::Brush& brush, Windows::UI::Color& color
     return color.A >= 128;
 }
 
-static void PublishBubbleKeyStyle(const Grid& keys) {
-    if (!g_shared || !ReadSettings().bubbleOnClose) return;
-    for (const auto& child : keys.Children()) {
-        const auto key = child.try_as<FrameworkElement>();
-        if (!key || key.Visibility() != Visibility::Visible) continue;
-        const auto face = FindNamed(key, L"TEMPLATE_PART_KeyBackgroundBorder").try_as<Border>();
-        const auto label = FindNamed(key, L"TEMPLATE_PART_KeyLabel").try_as<TextBlock>();
-        if (!face || !label || face.ActualWidth() <= 0 || face.ActualHeight() <= 0) continue;
-        Windows::UI::Color background{}, border{}, foreground{};
-        if (!ReadBubbleBrush(face.Background(), background)) continue;
-        if (!ReadBubbleBrush(label.Foreground(), foreground)) {
-            const int luminance = 299 * background.R + 587 * background.G + 114 * background.B;
-            const BYTE value = luminance >= 128000 ? 0 : 255;
-            foreground = {255, value, value, value};
-        }
-        const auto thickness = ReadBubbleBrush(face.BorderBrush(), border) ? face.BorderThickness().Left : 0;
-        const double basis = std::min(face.ActualWidth(), face.ActualHeight());
-        const auto pack = [](Windows::UI::Color color) -> UINT64 {
-            return ((color.R >> 3) << 11) | ((color.G >> 2) << 5) | (color.B >> 3);
-        };
-        const auto fraction = [basis](double value, double scale) -> UINT64 {
-            return std::isfinite(value) ? std::lround(std::clamp(value / basis, 0.0, 0.5) * scale) : 0;
-        };
-        const UINT64 style = (UINT64{1} << 63) | pack(background) | (pack(border) << 16) |
-            (pack(foreground) << 32) | (fraction(thickness, 254) << 56);
-        InterlockedExchange64(&g_shared->bubbleKeyStyle, static_cast<LONG64>(style));
-        return;
-    }
-}
-
 bool GetCloseButtonCenter(POINT& point) {
     try {
         const auto window = Window::Current();
@@ -3161,13 +3138,6 @@ void RefreshRow(HWND hwnd) {
         FooterKeys::t_shortcut = {};
         g_swipeKeyWidth.store(0, std::memory_order_relaxed);
         RemoveRow();
-    }
-    if (visible) {
-        try {
-            PublishBubbleKeyStyle(keys);
-        } catch (const hresult_error&) {
-            // Keep the last usable style, or use the built-in bubble appearance.
-        }
     }
     if (!compact) return;
     float swipeKeyWidth = 0;
